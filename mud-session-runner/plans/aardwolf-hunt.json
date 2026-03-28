@@ -1,0 +1,79 @@
+{
+  "game": "aardwolf",
+  "timeout": 300000,
+  "reportDir": "./sessions",
+  "phases": [
+    {
+      "name": "setup",
+      "commands": [
+        "recall",
+        "daily blessing",
+        "score",
+        "run u3n",
+        "drink fountain",
+        "drink fountain",
+        "sleep"
+      ],
+      "delay": 1500
+    },
+    {
+      "name": "regen",
+      "commands": [
+        { "wait": "IMPOSSIBLE_PATTERN_JUST_WAIT", "timeout": 20000, "send": "wake" },
+        "recall"
+      ],
+      "delay": 2000
+    },
+    {
+      "name": "travel",
+      "commands": [
+        "run 2s8e5ne5n3e",
+        "n",
+        "w",
+        "look"
+      ],
+      "delay": 2000
+    },
+    {
+      "name": "hunt-circuit-1",
+      "commands": [
+        "kill viper",
+        { "wait": "is slain|is DEAD|aren.t here", "send": "kill butterfly", "timeout": 12000 },
+        { "wait": "is slain|is DEAD|aren.t here", "send": "kill hare", "timeout": 12000 },
+        { "wait": "is slain|is DEAD|aren.t here", "send": "e", "timeout": 12000 },
+        "e",
+        "kill porcupine",
+        { "wait": "is slain|is DEAD|aren.t here", "send": "down", "timeout": 12000 },
+        "kill mole",
+        { "wait": "is slain|is DEAD|aren.t here", "send": "kill mole", "timeout": 12000 },
+        { "wait": "is slain|is DEAD|aren.t here", "send": "up", "timeout": 12000 },
+        "w",
+        "w"
+      ],
+      "delay": 1500
+    },
+    {
+      "name": "hunt-circuit-2",
+      "commands": [
+        "kill viper",
+        { "wait": "is slain|is DEAD|aren.t here", "send": "kill hare", "timeout": 12000 },
+        { "wait": "is slain|is DEAD|aren.t here", "send": "e", "timeout": 12000 },
+        "e",
+        "kill porcupine",
+        { "wait": "is slain|is DEAD|aren.t here", "send": "w", "timeout": 12000 },
+        "w",
+        "look"
+      ],
+      "delay": 1500
+    },
+    {
+      "name": "wrapup",
+      "commands": [
+        "score",
+        "inventory",
+        "recall"
+      ],
+      "delay": 1500
+    }
+  ]
+}

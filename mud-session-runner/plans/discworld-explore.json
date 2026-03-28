@@ -1,0 +1,45 @@
+{
+  "game": "discworld",
+  "timeout": 300000,
+  "reportDir": "./sessions",
+  "phases": [
+    {
+      "name": "orient",
+      "commands": [
+        "look",
+        "score",
+        "inventory",
+        "skills"
+      ],
+      "delay": 3000
+    },
+    {
+      "name": "explore",
+      "commands": [
+        "north",
+        "look",
+        "east",
+        "look",
+        "south",
+        "look",
+        "west",
+        "look",
+        "south",
+        "look",
+        "north",
+        "look"
+      ],
+      "delay": 3000
+    },
+    {
+      "name": "social",
+      "commands": [
+        "who",
+        "newbie hello from the disc, exploring ankh-morpork today",
+        "helpers",
+        "look"
+      ],
+      "delay": 4000
+    }
+  ]
+}

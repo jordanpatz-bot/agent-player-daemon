@@ -1,0 +1,35 @@
+{
+  "game": "aardwolf",
+  "timeout": 180000,
+  "reportDir": "./sessions",
+  "phases": [
+    {
+      "name": "check-in",
+      "commands": [
+        "score",
+        "channels",
+        "who",
+        "replay"
+      ],
+      "delay": 2000
+    },
+    {
+      "name": "socialize",
+      "commands": [
+        "newbie hey all, mycelico checking in. how goes it?",
+        { "wait": "newbie|Newbie", "send": "look", "timeout": 25000 },
+        "replay",
+        "channels"
+      ],
+      "delay": 3000
+    },
+    {
+      "name": "wrapup",
+      "commands": [
+        "score",
+        "look"
+      ],
+      "delay": 1500
+    }
+  ]
+}
