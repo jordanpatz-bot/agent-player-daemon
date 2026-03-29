@@ -4,9 +4,10 @@
 // Manages connection lifecycle, IPC, state machine, and persistent blackboard.
 //
 // Usage:
-//   node daemon.js --game aardwolf
-//   node daemon.js --game discworld
-//   pm2 start daemon.js --name mud-aardwolf -- --game aardwolf
+//   node daemon.js --profile mycelico        (Mico on Aardwolf)
+//   node daemon.js --profile rhizomi         (Rhizo on Discworld)
+//   node daemon.js --profile ectorhi         (Ecto on Aardwolf)
+//   pm2 start daemon.js --name mud-mycelico -- --profile mycelico
 
 const fs = require('fs');
 const path = require('path');
@@ -16,13 +17,11 @@ const { IpcServer } = require('./ipc');
 const { GameStateMachine } = require('./state-machine');
 const { OutputBuffer } = require('./output-buffer');
 
-// --- Game Configs (credentials should be externalized later) ---
-const GAMES = {
+// --- Game server templates ---
+const SERVERS = {
   aardwolf: {
     host: 'aardmud.org',
     port: 4000,
-    name: 'Mycelico',
-    pass: 'spore2network',
     loginDetect: 'what be thy name',
     passwordDetect: 'password',
     inGameDetect: /\d+hp\s+\d+.*mn\s+\d+.*mv/i,
@@ -34,8 +33,6 @@ const GAMES = {
   discworld: {
     host: 'discworld.starturtle.net',
     port: 4242,
-    name: 'Rhizomi',
-    pass: 'spore2flatworld',
     loginDetect: 'your choice',
     passwordDetect: 'password',
     inGameDetect: /obvious exits|inventory regeneration|> /i,
@@ -50,17 +47,43 @@ const GAMES = {
   },
 };
 
+// --- Character profiles (character + server + owner) ---
+// Credentials loaded from profiles.json if it exists, otherwise defaults here.
+function loadProfiles() {
+  const profilePath = path.join(__dirname, 'profiles.json');
+  if (fs.existsSync(profilePath)) {
+    const raw = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
+    // Merge server templates with profile credentials
+    const merged = {};
+    for (const [key, profile] of Object.entries(raw)) {
+      const server = SERVERS[profile.server];
+      if (!server) continue;
+      merged[key] = { ...server, ...profile };
+    }
+    return merged;
+  }
+  // Fallback defaults
+  return {
+    mycelico: { ...SERVERS.aardwolf, name: 'Mycelico', pass: 'spore2network', owner: 'mico', server: 'aardwolf' },
+    rhizomi: { ...SERVERS.discworld, name: 'Rhizomi', pass: 'spore2flatworld', owner: 'rhizo', server: 'discworld' },
+  };
+}
+
 // --- Parse args ---
 function parseArgs() {
   const args = process.argv.slice(2);
-  let game = 'aardwolf';
+  let profile = null;
+  let game = null; // legacy compat
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--game' && args[i + 1]) {
-      game = args[i + 1];
+    if (args[i] === '--profile' && args[i + 1]) {
+      profile = args[i + 1];
+      i++;
+    } else if (args[i] === '--game' && args[i + 1]) {
+      game = args[i + 1]; // legacy: treat as profile name
       i++;
     }
   }
-  return { game };
+  return { profile: profile || game || 'mycelico' };
 }
 
 // --- Lockfile guard ---
@@ -94,20 +117,21 @@ function releaseLock(lockPath) {
 
 // --- Main ---
 async function main() {
-  const { game: gameKey } = parseArgs();
-  const gameConfig = GAMES[gameKey];
+  const { profile: profileKey } = parseArgs();
+  const profiles = loadProfiles();
+  const gameConfig = profiles[profileKey];
   if (!gameConfig) {
-    console.error(`Unknown game: ${gameKey}. Available: ${Object.keys(GAMES).join(', ')}`);
+    console.error(`Unknown profile: ${profileKey}. Available: ${Object.keys(profiles).join(', ')}`);
     process.exit(1);
   }
 
-  const dataDir = path.join(__dirname, 'data', gameKey);
+  const dataDir = path.join(__dirname, 'data', profileKey);
   fs.mkdirSync(dataDir, { recursive: true });
 
   // --- Lockfile ---
   const lockPath = path.join(dataDir, 'daemon.lock');
   if (!acquireLock(lockPath)) {
-    console.error(`Another daemon is already running for ${gameKey}. Lock: ${lockPath}`);
+    console.error(`Another daemon is already running for ${profileKey}. Lock: ${lockPath}`);
     process.exit(1);
   }
 
@@ -263,7 +287,7 @@ async function main() {
   // --- Status endpoint (write periodic status file) ---
   function writeStatus() {
     const status = {
-      game: gameKey,
+      game: profileKey,
       pid: process.pid,
       uptime: process.uptime(),
       connectionState: connection.getState(),
@@ -313,7 +337,7 @@ async function main() {
   process.on('SIGINT', () => shutdown('SIGINT'));
 
   // --- Start ---
-  log('SYS', `=== MUD Daemon starting for ${gameKey} ===`);
+  log('SYS', `=== MUD Daemon starting for ${profileKey} ===`);
   log('SYS', `Data dir: ${dataDir}`);
   log('SYS', `PID: ${process.pid}`);
 
