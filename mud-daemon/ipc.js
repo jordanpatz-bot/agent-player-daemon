@@ -2,11 +2,13 @@
 // ipc.js — File-based command interface for the MUD daemon.
 // Mico writes command files, daemon processes them and writes results.
 //
-// Protocol:
+// Protocol (three-file):
 //   Command: ipc/commands/<id>.json → { id, commands: [...], waitFor?, timeout? }
-//   Result:  ipc/results/<id>.json  → { id, status, output, events, blackboard }
+//   Ack:     ipc/ack/<id>.json     → { id, status: "received", daemonState, timestamp }
+//   Result:  ipc/results/<id>.json → { id, status, output, events, blackboard }
 //
 // Atomic writes: write .tmp, rename. Daemon deletes command file after reading.
+// Uses fs.watch for sub-second command detection (social response timing).
 
 const fs = require('fs');
 const path = require('path');
@@ -15,12 +17,16 @@ class IpcServer {
   constructor(options = {}) {
     this.baseDir = options.baseDir || path.join(process.cwd(), 'ipc');
     this.commandsDir = path.join(this.baseDir, 'commands');
+    this.ackDir = path.join(this.baseDir, 'ack');
     this.resultsDir = path.join(this.baseDir, 'results');
     this.pollIntervalMs = options.pollIntervalMs || 1000;
     this._pollTimer = null;
+    this._watcher = null;
     this._handler = null;
+    this._getState = options.getState || (() => 'unknown'); // fn returning daemon state
 
     fs.mkdirSync(this.commandsDir, { recursive: true });
+    fs.mkdirSync(this.ackDir, { recursive: true });
     fs.mkdirSync(this.resultsDir, { recursive: true });
   }
 
@@ -31,8 +37,28 @@ class IpcServer {
 
   start() {
     if (this._pollTimer) return;
-    this._poll(); // immediate first check
-    this._pollTimer = setInterval(() => this._poll(), this.pollIntervalMs);
+    this._poll(); // immediate first check — catch any commands written before start
+
+    // fs.watch for sub-second detection
+    try {
+      this._watcher = fs.watch(this.commandsDir, (eventType, filename) => {
+        if (filename && filename.endsWith('.json')) {
+          // Small delay to ensure atomic rename is complete
+          setTimeout(() => this._poll(), 50);
+        }
+      });
+      this._watcher.on('error', () => {
+        // Fallback to polling if watch fails
+        if (!this._pollTimer) {
+          this._pollTimer = setInterval(() => this._poll(), this.pollIntervalMs);
+        }
+      });
+    } catch {
+      // fs.watch not available — fall back to polling
+    }
+
+    // Safety net: poll every 5s in case fs.watch misses events
+    this._pollTimer = setInterval(() => this._poll(), 5000);
   }
 
   stop() {
@@ -40,6 +66,24 @@ class IpcServer {
       clearInterval(this._pollTimer);
       this._pollTimer = null;
     }
+    if (this._watcher) {
+      this._watcher.close();
+      this._watcher = null;
+    }
+  }
+
+  // Write immediate acknowledgment (daemon received command)
+  _writeAck(id) {
+    const ack = {
+      id,
+      status: 'received',
+      daemonState: this._getState(),
+      timestamp: new Date().toISOString(),
+    };
+    const filePath = path.join(this.ackDir, `${id}.json`);
+    const tmp = filePath + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(ack, null, 2));
+    fs.renameSync(tmp, filePath);
   }
 
   // Write a result file (called by daemon after processing)
@@ -75,6 +119,9 @@ class IpcServer {
           command.id = path.basename(file, '.json');
         }
 
+        // Write immediate ack
+        this._writeAck(command.id);
+
         if (this._handler) {
           try {
             const result = await this._handler(command);
@@ -105,9 +152,11 @@ class IpcClient {
   constructor(options = {}) {
     this.baseDir = options.baseDir || path.join(process.cwd(), 'ipc');
     this.commandsDir = path.join(this.baseDir, 'commands');
+    this.ackDir = path.join(this.baseDir, 'ack');
     this.resultsDir = path.join(this.baseDir, 'results');
 
     fs.mkdirSync(this.commandsDir, { recursive: true });
+    fs.mkdirSync(this.ackDir, { recursive: true });
     fs.mkdirSync(this.resultsDir, { recursive: true });
   }
 
@@ -128,6 +177,17 @@ class IpcClient {
     fs.renameSync(tmp, filePath);
 
     return id;
+  }
+
+  // Check if command was acknowledged (non-blocking)
+  getAck(id) {
+    const filePath = path.join(this.ackDir, `${id}.json`);
+    if (!fs.existsSync(filePath)) return null;
+    try {
+      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    } catch {
+      return null;
+    }
   }
 
   // Check if result is ready (non-blocking)

@@ -14,8 +14,9 @@ const path = require('path');
 const { MudConnection } = require('./connection');
 const { BlackboardStore } = require('./blackboard-store');
 const { IpcServer } = require('./ipc');
-const { GameStateMachine } = require('./state-machine');
+const { ConnectionStateMachine } = require('./state-machine');
 const { OutputBuffer } = require('./output-buffer');
+const { GmcpHandler } = require('./gmcp');
 
 // --- Game server templates ---
 const SERVERS = {
@@ -145,11 +146,15 @@ async function main() {
     maxSize: 100000,
   });
 
+  const stateMachine = new ConnectionStateMachine();
+
   const ipc = new IpcServer({
     baseDir: path.join(dataDir, 'ipc'),
+    getState: () => stateMachine.getState(),
   });
 
   const connection = new MudConnection(gameConfig);
+  const gmcp = new GmcpHandler();
 
   function log(type, msg) {
     const ts = new Date().toISOString().substring(11, 19);
@@ -161,40 +166,104 @@ async function main() {
     } catch { /* non-fatal */ }
   }
 
-  const ctx = { blackboard, connection, log };
-  const stateMachine = new GameStateMachine(ctx);
+  // --- Activity digest ---
+  const digestEvents = []; // significant events for periodic digest
+
+  function recordDigestEvent(type, detail) {
+    digestEvents.push({ type, detail, at: new Date().toISOString() });
+    if (digestEvents.length > 100) digestEvents.shift();
+  }
+
+  function writeDigest() {
+    const digest = {
+      profile: profileKey,
+      connectionState: stateMachine.getState(),
+      playingUptime: stateMachine.getUptime(),
+      blackboard: {
+        hp: blackboard.get('hp'),
+        maxHp: blackboard.get('maxHp'),
+        killCount: blackboard.get('killCount'),
+        currentRoom: blackboard.get('currentRoom'),
+      },
+      recentEvents: digestEvents.slice(-20),
+      timestamp: new Date().toISOString(),
+    };
+    const tmp = path.join(dataDir, 'digest.json.tmp');
+    const dest = path.join(dataDir, 'digest.json');
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(digest, null, 2));
+      fs.renameSync(tmp, dest);
+    } catch { /* non-fatal */ }
+  }
 
   // --- Wire connection events ---
   connection.on('connected', () => {
     log('SYS', `Connected to ${gameConfig.host}:${gameConfig.port}`);
+    stateMachine.transition('connecting');
+    // Send GMCP negotiation
+    connection.socket.write(gmcp.negotiateOn());
   });
 
   connection.on('loggedIn', () => {
     log('SYS', '*** IN GAME ***');
-    stateMachine.transition('idle');
+    stateMachine.transition('playing');
+    recordDigestEvent('login', 'Connected and in game');
   });
 
   connection.on('disconnected', ({ wasPlaying }) => {
     log('SYS', `Disconnected (wasPlaying: ${wasPlaying})`);
     stateMachine.transition('disconnected');
+    recordDigestEvent('disconnect', `wasPlaying: ${wasPlaying}`);
   });
 
   connection.on('reconnecting', ({ attempt, delay, maxAttempts }) => {
     log('SYS', `Reconnecting in ${(delay / 1000).toFixed(1)}s (attempt ${attempt}/${maxAttempts})`);
+    stateMachine.transition('reconnecting');
   });
 
   connection.on('reconnectFailed', ({ message }) => {
-    log('ERR', `Reconnect failed: ${message}. Daemon will stay alive, waiting for manual restart or IPC reconnect command.`);
+    log('ERR', `Reconnect failed: ${message}. Daemon stays alive for IPC reconnect.`);
+    recordDigestEvent('reconnect-failed', message);
   });
 
   connection.on('error', (err) => {
     log('ERR', `Connection error: ${err.message}`);
   });
 
+  // --- GMCP events ---
+  gmcp.on('gmcp-ready', () => {
+    log('GMCP', 'Server supports GMCP — registering packages');
+    for (const msg of gmcp.supportMessages()) {
+      connection.socket.write(msg);
+    }
+  });
+
+  gmcp.on('char.vitals', (data) => {
+    blackboard.update({
+      hp: parseInt(data.hp) || blackboard.get('hp'),
+      maxHp: parseInt(data.maxhp) || blackboard.get('maxHp'),
+      mana: parseInt(data.mana) || blackboard.get('mana'),
+      maxMana: parseInt(data.maxmana) || blackboard.get('maxMana'),
+    });
+  });
+
+  gmcp.on('room.info', (data) => {
+    blackboard.set('currentRoom', {
+      name: data.name || 'unknown',
+      zone: data.zone || 'unknown',
+      exits: data.exits ? Object.keys(data.exits) : [],
+    });
+  });
+
+  gmcp.on('comm.channel', (data) => {
+    recordDigestEvent('channel', `[${data.chan}] ${data.player}: ${(data.msg || '').substring(0, 100)}`);
+  });
+
+  // --- Wire data pipeline ---
   connection.on('data', (text) => {
     outputBuffer.append(text);
 
-    // Parse HP prompt
+    // Fallback: regex HP prompt parsing (when GMCP not available)
     if (gameConfig.promptPattern) {
       const m = text.match(gameConfig.promptPattern);
       if (m) {
@@ -207,12 +276,11 @@ async function main() {
       }
     }
 
-    // Feed events to state machine (basic extraction for now)
+    // Track kills for digest
     if (/is slain|is DEAD/i.test(text)) {
-      stateMachine.processEvent({ type: 'mob_killed' });
-    }
-    if (/You begin your attack/i.test(text)) {
-      stateMachine.processEvent({ type: 'combat_start' });
+      const count = (blackboard.get('killCount') || 0) + 1;
+      blackboard.set('killCount', count);
+      recordDigestEvent('kill', `Kill #${count}`);
     }
   });
 
@@ -313,6 +381,7 @@ async function main() {
   }
 
   const statusTimer = setInterval(writeStatus, 15000);
+  const digestTimer = setInterval(writeDigest, 900000); // 15 min digest
 
   // --- Graceful shutdown ---
   function shutdown(signal) {
@@ -320,8 +389,10 @@ async function main() {
     ipc.stop();
     outputBuffer.stopSnapshots();
     clearInterval(statusTimer);
+    clearInterval(digestTimer);
     blackboard.saveNow();
     writeStatus();
+    writeDigest();
 
     connection.disconnect();
 
