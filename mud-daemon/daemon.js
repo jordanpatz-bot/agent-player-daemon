@@ -30,6 +30,9 @@ const SERVERS = {
     promptPattern: /\[(\d+)\/(\d+)hp\s+(\d+)\/(\d+)mn\s+(\d+)\/(\d+)mv\s+(\d+)qt\s+(\d+)tnl\]/,
     quitCommands: ['quit quit', 'y'],
     debounceMs: 800,
+    extraLogin: [
+      { detect: 'already playing|do you wish to reconnect', send: 'y' },
+    ],
   },
   discworld: {
     host: 'discworld.starturtle.net',
@@ -296,6 +299,8 @@ async function main() {
       };
     }
 
+    // Snapshot buffer length BEFORE sending any commands.
+    // Previously this was after the first send, which missed output from fast commands.
     const startBuffer = outputBuffer.getAll().length;
     const events = [];
 
@@ -416,10 +421,17 @@ async function main() {
   ipc.start();
   connection.connect();
 
-  // Keep process alive
+  // Keepalive — send a no-op command every 10 minutes to prevent idle timeout.
+  // Aardwolf kicks idle connections after ~35 minutes; this keeps us under that.
+  // Only fires when connected and playing. The command 'time' is silent and harmless.
+  const KEEPALIVE_MS = 10 * 60 * 1000; // 10 minutes
+  const KEEPALIVE_CMD = gameConfig.server === 'discworld' ? 'date' : 'time';
   setInterval(() => {
-    // Heartbeat — prevents event loop from exiting
-  }, 60000);
+    if (connection.isPlaying()) {
+      connection.send(KEEPALIVE_CMD);
+      log('SYS', `Keepalive sent: ${KEEPALIVE_CMD}`);
+    }
+  }, KEEPALIVE_MS);
 }
 
 main().catch(err => {
