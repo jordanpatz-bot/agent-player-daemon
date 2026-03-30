@@ -35,10 +35,16 @@ class ConnectionStateMachine extends EventEmitter {
   }
 
   transition(newState) {
-    if (!STATES[newState]) return false;
+    if (!STATES[newState]) {
+      console.warn(`[StateMachine] Invalid state: "${newState}" (not in STATES)`);
+      return false;
+    }
 
     const current = STATES[this.currentState];
-    if (!current.transitions.includes(newState)) return false;
+    if (!current.transitions.includes(newState)) {
+      console.warn(`[StateMachine] Invalid transition: "${this.currentState}" → "${newState}" (allowed: ${current.transitions.join(', ')})`);
+      return false;
+    }
 
     const oldState = this.currentState;
     this.currentState = newState;

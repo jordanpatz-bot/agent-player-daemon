@@ -1,0 +1,38 @@
+{
+  "mycelico": {
+    "server": "aardwolf",
+    "name": "Mycelico",
+    "pass": "CHANGE_ME",
+    "owner": "mico",
+    "class": "ranger",
+    "level": 8
+  },
+  "rhizomi": {
+    "server": "discworld",
+    "name": "Rhizomi",
+    "pass": "CHANGE_ME",
+    "owner": "rhizo",
+    "class": "explorer",
+    "level": 1
+  },
+  "rhizome": {
+    "server": "aardwolf",
+    "name": "Rhizome",
+    "pass": "CHANGE_ME",
+    "owner": "rhizo",
+    "class": "ranger",
+    "subclass": "shaman",
+    "race": "human",
+    "level": 1
+  },
+  "ectosheath": {
+    "server": "aardwolf",
+    "name": "Ectosheath",
+    "pass": "CHANGE_ME",
+    "owner": "ecto",
+    "class": "ranger",
+    "subclass": "hunter",
+    "race": "human",
+    "level": 1
+  }
+}

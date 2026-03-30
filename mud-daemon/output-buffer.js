@@ -12,16 +12,39 @@ class OutputBuffer {
     this.filePath = options.filePath || path.join(process.cwd(), 'output-buffer.txt');
     this.snapshotIntervalMs = options.snapshotIntervalMs || 30000; // 30s
     this._snapshotTimer = null;
+    this._totalAppended = 0; // monotonic counter — total chars ever appended
+    this._trimmed = 0;       // total chars trimmed from front
   }
 
   append(text) {
+    this._totalAppended += text.length;
     this.buffer += text;
     if (this.buffer.length > this.maxSize) {
       // Keep the last maxSize chars, cut at a newline boundary if possible
       const cutPoint = this.buffer.length - this.maxSize;
       const newlineAfterCut = this.buffer.indexOf('\n', cutPoint);
-      this.buffer = this.buffer.slice(newlineAfterCut >= 0 ? newlineAfterCut + 1 : cutPoint);
+      const actualCut = newlineAfterCut >= 0 ? newlineAfterCut + 1 : cutPoint;
+      this._trimmed += actualCut;
+      this.buffer = this.buffer.slice(actualCut);
     }
+  }
+
+  // Get a stable cursor position that survives ring buffer wrapping.
+  // Use with getOutputSince(cursor) to reliably capture new output.
+  getCursor() {
+    return this._totalAppended;
+  }
+
+  // Get all output appended since the given cursor.
+  // Returns '' if cursor is too old (data already trimmed).
+  getOutputSince(cursor) {
+    const available = this._totalAppended - cursor;
+    if (available <= 0) return '';
+    if (available > this.buffer.length) {
+      // Some output was lost to ring buffer trimming — return what we have
+      return this.buffer;
+    }
+    return this.buffer.slice(this.buffer.length - available);
   }
 
   // Get recent output (last N chars)
