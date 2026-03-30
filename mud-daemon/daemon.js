@@ -174,8 +174,13 @@ async function main() {
     getState: () => stateMachine.getState(),
   });
 
-  const connection = new MudConnection(gameConfig);
   const gmcp = new GmcpHandler();
+  const connection = new MudConnection(gameConfig, {
+    // Pipe raw socket bytes through GMCP handler before text cleaning.
+    // gmcp.processRaw extracts GMCP subnegotiations, emits events,
+    // and returns remaining bytes for normal text processing.
+    rawPreprocessor: (buf) => gmcp.processRaw(buf),
+  });
 
   function log(type, msg) {
     const ts = new Date().toISOString().substring(11, 19);
@@ -270,11 +275,17 @@ async function main() {
   });
 
   gmcp.on('room.info', (data) => {
+    log('GMCP', `Room: ${data.name || 'unknown'} [${data.zone || 'unknown'}]`);
     blackboard.set('currentRoom', {
       name: data.name || 'unknown',
       zone: data.zone || 'unknown',
       exits: data.exits ? Object.keys(data.exits) : [],
     });
+  });
+
+  // Log all GMCP messages for visibility (can be removed once stable)
+  gmcp.on('message', (pkg, data) => {
+    log('GMCP', `${pkg}: ${JSON.stringify(data).substring(0, 200)}`);
   });
 
   gmcp.on('comm.channel', (data) => {

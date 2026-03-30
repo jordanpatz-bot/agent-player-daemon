@@ -24,6 +24,9 @@ class MudConnection extends EventEmitter {
     this.debounceTimer = null;
     this.pending = '';
     this.lockFile = options.lockFile || null;
+    // Optional raw data preprocessor — receives Buffer, returns Buffer.
+    // Used by daemon.js to pipe raw bytes through GMCP handler before text cleaning.
+    this._rawPreprocessor = options.rawPreprocessor || null;
 
     // Graceful shutdown
     this._shutdownRequested = false;
@@ -41,17 +44,28 @@ class MudConnection extends EventEmitter {
       port: this.game.port,
     });
 
-    this.socket.setEncoding('utf8');
+    // Do NOT set encoding — we need raw Buffers for GMCP binary processing.
+    // The rawPreprocessor (if provided) handles GMCP subnegotiation extraction
+    // before we convert to string for text cleaning.
 
     this.socket.on('connect', () => {
-      this.reconnectAttempts = 0;
+      // Don't reset reconnectAttempts here — only reset after stable play
+      // (see _processLogin 'playing' transition)
       this.state = 'connected';
       this.emit('connected');
       this.emit('stateChange', 'connected');
     });
 
-    this.socket.on('data', (raw) => {
-      const cleaned = this._clean(raw);
+    this.socket.on('data', (rawBuf) => {
+      // rawBuf is a Buffer (no encoding set on socket).
+      // 1. Run raw bytes through preprocessor (GMCP extraction) if wired
+      let textBuf = rawBuf;
+      if (this._rawPreprocessor) {
+        textBuf = this._rawPreprocessor(rawBuf);
+      }
+      // 2. Convert to string using latin1 (preserves byte values 0x00-0xFF)
+      //    then apply regex-based telnet/ANSI cleaning
+      const cleaned = this._clean(textBuf.toString('latin1'));
       this.pending += cleaned;
 
       if (this.debounceTimer) clearTimeout(this.debounceTimer);
@@ -68,6 +82,18 @@ class MudConnection extends EventEmitter {
     });
 
     this.socket.on('close', () => {
+      // Cancel pending debounce to prevent state transition on dead socket
+      if (this.debounceTimer) {
+        clearTimeout(this.debounceTimer);
+        this.debounceTimer = null;
+        this.pending = '';
+      }
+      // Cancel stable play timer
+      if (this._stableTimer) {
+        clearTimeout(this._stableTimer);
+        this._stableTimer = null;
+      }
+
       const wasPlaying = this.state === 'playing';
       this.state = 'disconnected';
       this.emit('disconnected', { wasPlaying });
@@ -171,14 +197,29 @@ class MudConnection extends EventEmitter {
       }
     }
 
-    // Detect in-game
-    if (this.state !== 'playing') {
+    // Detect in-game — only if socket is still alive
+    if (this.state !== 'playing' && this.state !== 'disconnected') {
       if (this.game.inGameDetect.test(data)) {
         this.state = 'playing';
         this.emit('loggedIn');
         this.emit('stateChange', 'playing');
+        // Reset reconnect counter only after reaching stable play
+        // (30s grace period set in _stablePlayTimer)
+        this._startStableTimer();
       }
     }
+  }
+
+  _startStableTimer() {
+    // Only reset reconnect counter after staying connected for 30s
+    // This prevents the counter from resetting on flash connections
+    if (this._stableTimer) clearTimeout(this._stableTimer);
+    this._stableTimer = setTimeout(() => {
+      if (this.state === 'playing') {
+        this.reconnectAttempts = 0;
+      }
+      this._stableTimer = null;
+    }, 30000);
   }
 
   _scheduleReconnect() {
