@@ -371,11 +371,11 @@ async function main() {
   function waitForPattern(pattern, timeoutMs) {
     return new Promise((resolve) => {
       const re = typeof pattern === 'string' ? new RegExp(pattern, 'i') : pattern;
-      const startLen = outputBuffer.getAll().length;
+      const startCursor = outputBuffer.getCursor();
       const deadline = Date.now() + timeoutMs;
 
       const check = setInterval(() => {
-        const newText = outputBuffer.getAll().slice(startLen);
+        const newText = outputBuffer.getOutputSince(startCursor);
         if (re.test(newText)) {
           clearInterval(check);
           resolve(true);
