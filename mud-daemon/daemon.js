@@ -140,9 +140,27 @@ async function main() {
   }
 
   // --- Components ---
+  // Pass profile-specific defaults so TTL-expired fields return THIS character's
+  // identity, not the hardcoded Mycelico defaults from blackboard-store.js.
   const blackboard = new BlackboardStore({
     filePath: path.join(dataDir, 'blackboard.json'),
+    defaults: {
+      name: gameConfig.name || profileKey,
+      level: gameConfig.level || 1,
+      class: gameConfig.class || 'unknown',
+    },
   });
+
+  // Seed blackboard identity from profile config on first run or after reset.
+  const currentName = blackboard.get('name');
+  if (!currentName || currentName === 'Mycelico') {
+    blackboard.update({
+      name: gameConfig.name || profileKey,
+      level: gameConfig.level || 1,
+      class: gameConfig.class || 'unknown',
+    });
+    log('SYS', `Blackboard identity seeded: ${gameConfig.name}, level ${gameConfig.level || 1}`);
+  }
 
   const outputBuffer = new OutputBuffer({
     filePath: path.join(dataDir, 'output-buffer.txt'),
@@ -392,6 +410,10 @@ async function main() {
   // --- Graceful shutdown ---
   function shutdown(signal) {
     log('SYS', `Shutdown requested (${signal})`);
+    // Release lock IMMEDIATELY so new process doesn't race against our
+    // graceful shutdown window. PM2 kill_timeout (1.6s default) is shorter
+    // than a 6s grace period — if we wait, SIGKILL drops us with lock held.
+    releaseLock(lockPath);
     ipc.stop();
     outputBuffer.stopSnapshots();
     clearInterval(statusTimer);
@@ -404,7 +426,6 @@ async function main() {
 
     // Give connection time to quit gracefully
     setTimeout(() => {
-      releaseLock(lockPath);
       log('SYS', 'Daemon stopped.');
       process.exit(0);
     }, 6000);
@@ -420,6 +441,12 @@ async function main() {
 
   outputBuffer.startSnapshots();
   ipc.start();
+
+  // Brief delay before connecting — if a previous instance just released its lock,
+  // the old Aardwolf session may still be alive server-side. 3s lets it expire
+  // before we trigger "already playing" / extraLogin dance.
+  log('SYS', 'Waiting 3s for stale sessions to clear...');
+  await new Promise(resolve => setTimeout(resolve, 3000));
   connection.connect();
 
   // Keepalive — send a no-op command every 10 minutes to prevent idle timeout.

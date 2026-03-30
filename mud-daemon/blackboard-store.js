@@ -64,6 +64,9 @@ class BlackboardStore {
   constructor(options = {}) {
     this.filePath = options.filePath || path.join(process.cwd(), 'blackboard.json');
     this.saveDebounceMs = options.saveDebounceMs || 5000;
+    // Profile-specific defaults override the hardcoded DEFAULTS.
+    // Fixes: all profiles falling back to 'Mycelico' on TTL expiry.
+    this._defaults = { ...DEFAULTS, ...(options.defaults || {}) };
     this._saveTimer = null;
     this._dirty = false;
     this._data = {};
@@ -78,10 +81,10 @@ class BlackboardStore {
       const age = Date.now() - this._timestamps[field];
       if (age > ttl) {
         // Expired — return default
-        return DEFAULTS[field] !== undefined ? DEFAULTS[field] : null;
+        return this._defaults[field] !== undefined ? this._defaults[field] : null;
       }
     }
-    return this._data[field] !== undefined ? this._data[field] : (DEFAULTS[field] !== undefined ? DEFAULTS[field] : null);
+    return this._data[field] !== undefined ? this._data[field] : (this._defaults[field] !== undefined ? this._defaults[field] : null);
   }
 
   // Set a field value
@@ -105,13 +108,13 @@ class BlackboardStore {
   snapshot() {
     const now = Date.now();
     const snap = {};
-    for (const field of Object.keys({ ...DEFAULTS, ...this._data })) {
+    for (const field of Object.keys({ ...this._defaults, ...this._data })) {
       const ttl = FIELD_TTLS[field];
       const ts = this._timestamps[field] || 0;
       const age = now - ts;
       const stale = ttl && ttl > 0 && age > ttl;
       snap[field] = {
-        value: stale ? DEFAULTS[field] : (this._data[field] !== undefined ? this._data[field] : DEFAULTS[field]),
+        value: stale ? this._defaults[field] : (this._data[field] !== undefined ? this._data[field] : this._defaults[field]),
         stale,
         ageMs: ts ? age : null,
       };
@@ -122,7 +125,7 @@ class BlackboardStore {
   // Get a clean object for the social bridge (matches old blackboard shape)
   toBlackboard() {
     const bb = {};
-    for (const field of Object.keys(DEFAULTS)) {
+    for (const field of Object.keys(this._defaults)) {
       bb[field] = this.get(field);
     }
     // Add computed properties
