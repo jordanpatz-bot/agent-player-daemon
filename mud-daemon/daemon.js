@@ -209,7 +209,8 @@ async function main() {
 
   connection.on('loggedIn', () => {
     log('SYS', '*** IN GAME ***');
-    stateMachine.transition('playing');
+    stateMachine.transition('login');   // connecting → login (required intermediate)
+    stateMachine.transition('playing'); // login → playing
     recordDigestEvent('login', 'Connected and in game');
   });
 
@@ -299,9 +300,10 @@ async function main() {
       };
     }
 
-    // Snapshot buffer length BEFORE sending any commands.
-    // Previously this was after the first send, which missed output from fast commands.
-    const startBuffer = outputBuffer.getAll().length;
+    // Use cursor-based tracking that survives ring buffer wrapping.
+    // Old approach used getAll().length which broke when the ring buffer
+    // trimmed old content between start and end measurements.
+    const startCursor = outputBuffer.getCursor();
     const events = [];
 
     // Send each command with delay
@@ -326,8 +328,7 @@ async function main() {
 
     // Collect output since command started
     await new Promise(r => setTimeout(r, 2000)); // settle time
-    const fullBuffer = outputBuffer.getAll();
-    const newOutput = fullBuffer.slice(startBuffer);
+    const newOutput = outputBuffer.getOutputSince(startCursor);
 
     return {
       output: newOutput.slice(-5000), // cap at 5KB
