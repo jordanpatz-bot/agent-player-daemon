@@ -20,6 +20,12 @@ const FIELD_TTLS = {
   alertLevel: 300000,
   momentum: 300000,
 
+  // Game state (Phase 2) — volatile
+  gameState: 60000,          // 1 min — stale = assume idle
+  recentEvents: 300000,      // 5 min
+  decisionNeeded: 60000,     // 1 min
+  decisionReason: 60000,
+
   // Durable — persist across restarts
   name: 0,
   level: 0,
@@ -58,6 +64,10 @@ const DEFAULTS = {
   habituationScores: {},
   sessionGoal: 'hunt',
   socialCooldownMs: 30000,
+  gameState: 'idle',
+  recentEvents: [],
+  decisionNeeded: false,
+  decisionReason: null,
 };
 
 class BlackboardStore {

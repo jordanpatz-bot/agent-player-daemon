@@ -17,6 +17,7 @@ const { IpcServer } = require('./ipc');
 const { ConnectionStateMachine } = require('./state-machine');
 const { OutputBuffer } = require('./output-buffer');
 const { GmcpHandler } = require('./gmcp');
+const { GameStateEngine } = require('./game-state');
 
 // --- Game server templates ---
 const SERVERS = {
@@ -175,6 +176,28 @@ async function main() {
   });
 
   const gmcp = new GmcpHandler();
+
+  // --- Game State Engine (Phase 2) ---
+  // Layers on connection state machine: tracks idle/combat/exploring/resting,
+  // runs reflexes (auto-heal, auto-flee), logs events to blackboard.
+  const gameState = new GameStateEngine({
+    blackboard,
+    log,
+  });
+
+  // Wire reflex actions — when the engine triggers a reflex, send it to the MUD.
+  // Reflexes are combat-gated and mutex-gated inside GameStateEngine.
+  gameState.on('reflex', (cmd) => {
+    if (connection.isPlaying()) {
+      connection.send(cmd);
+      log('REFLEX', `Sent: "${cmd}"`);
+    }
+  });
+
+  gameState.on('transition', ({ from, to, reason }) => {
+    log('GAME', `State: ${from} → ${to} (${reason})`);
+  });
+
   const connection = new MudConnection(gameConfig, {
     // Pipe raw socket bytes through GMCP handler before text cleaning.
     // gmcp.processRaw extracts GMCP subnegotiations, emits events,
@@ -266,12 +289,13 @@ async function main() {
   });
 
   gmcp.on('char.vitals', (data) => {
-    blackboard.update({
-      hp: parseInt(data.hp) || blackboard.get('hp'),
-      maxHp: parseInt(data.maxhp) || blackboard.get('maxHp'),
-      mana: parseInt(data.mana) || blackboard.get('mana'),
-      maxMana: parseInt(data.maxmana) || blackboard.get('maxMana'),
-    });
+    const hp = parseInt(data.hp) || blackboard.get('hp');
+    const maxHp = parseInt(data.maxhp) || blackboard.get('maxHp');
+    const mana = parseInt(data.mana) || blackboard.get('mana');
+    const maxMana = parseInt(data.maxmana) || blackboard.get('maxMana');
+    blackboard.update({ hp, maxHp, mana, maxMana });
+    // Feed vitals to game state engine for reflex evaluation
+    gameState.processVitals(hp, maxHp, mana, maxMana);
   });
 
   gmcp.on('room.info', (data) => {
@@ -296,16 +320,20 @@ async function main() {
   connection.on('data', (text) => {
     outputBuffer.append(text);
 
+    // Feed text to game state engine for state detection + reflexes
+    gameState.processText(text);
+
     // Fallback: regex HP prompt parsing (when GMCP not available)
     if (gameConfig.promptPattern) {
       const m = text.match(gameConfig.promptPattern);
       if (m) {
-        blackboard.update({
-          hp: parseInt(m[1]),
-          maxHp: parseInt(m[2]),
-          mana: parseInt(m[3]),
-          maxMana: parseInt(m[4]),
-        });
+        const hp = parseInt(m[1]);
+        const maxHp = parseInt(m[2]);
+        const mana = parseInt(m[3]);
+        const maxMana = parseInt(m[4]);
+        blackboard.update({ hp, maxHp, mana, maxMana });
+        // Feed prompt-parsed vitals to game state engine too
+        gameState.processVitals(hp, maxHp, mana, maxMana);
       }
     }
 
@@ -329,42 +357,62 @@ async function main() {
       };
     }
 
+    // Acquire mutex — prevents reflexes from interleaving with IPC commands
+    gameState.acquireMutex();
+
     // Use cursor-based tracking that survives ring buffer wrapping.
-    // Old approach used getAll().length which broke when the ring buffer
-    // trimmed old content between start and end measurements.
     const startCursor = outputBuffer.getCursor();
     const events = [];
 
-    // Send each command with delay
-    for (let i = 0; i < command.commands.length; i++) {
-      const cmd = command.commands[i];
+    try {
+      // Send each command with delay
+      for (let i = 0; i < command.commands.length; i++) {
+        const cmd = command.commands[i];
 
-      if (typeof cmd === 'string') {
-        connection.send(cmd);
-        log('IPC', `Sent: "${cmd}"`);
-        // Wait between commands
-        await new Promise(r => setTimeout(r, 1500));
-      } else if (typeof cmd === 'object' && cmd.wait) {
-        // Wait-for pattern
-        const matched = await waitForPattern(cmd.wait, cmd.timeout || 15000);
-        log('IPC', matched ? `Wait matched: ${cmd.wait}` : `Wait timed out: ${cmd.wait}`);
-        if (cmd.send) {
-          connection.send(cmd.send);
+        if (typeof cmd === 'string') {
+          connection.send(cmd);
+          log('IPC', `Sent: "${cmd}"`);
           await new Promise(r => setTimeout(r, 1500));
+        } else if (typeof cmd === 'object' && cmd.wait) {
+          // Wait-for pattern
+          const matched = await waitForPattern(cmd.wait, cmd.timeout || 15000);
+          log('IPC', matched ? `Wait matched: ${cmd.wait}` : `Wait timed out: ${cmd.wait}`);
+          if (cmd.send) {
+            connection.send(cmd.send);
+            await new Promise(r => setTimeout(r, 1500));
+          }
+        } else if (typeof cmd === 'object' && cmd.action) {
+          // Typed command — translate and send
+          const result = gameState.translateCommand(cmd);
+          if (result.error) {
+            log('IPC', `Typed command rejected: ${result.error}`);
+            events.push({ type: 'command_error', detail: result.error });
+          } else {
+            connection.send(result.command);
+            log('IPC', `Typed [${cmd.action}] → "${result.command}"`);
+            await new Promise(r => setTimeout(r, 1500));
+          }
         }
       }
+
+      // Collect output since command started
+      await new Promise(r => setTimeout(r, 2000)); // settle time
+      const newOutput = outputBuffer.getOutputSince(startCursor);
+
+      // Clear decision flag — agent has responded by sending commands
+      gameState.clearDecision();
+
+      return {
+        output: newOutput.slice(-5000), // cap at 5KB
+        events,
+        state: stateMachine.getState(),
+        gameState: gameState.snapshot(),
+        blackboard: blackboard.snapshot(),
+      };
+    } finally {
+      // Always release mutex, even on error
+      gameState.releaseMutex();
     }
-
-    // Collect output since command started
-    await new Promise(r => setTimeout(r, 2000)); // settle time
-    const newOutput = outputBuffer.getOutputSince(startCursor);
-
-    return {
-      output: newOutput.slice(-5000), // cap at 5KB
-      events,
-      state: stateMachine.getState(),
-      blackboard: blackboard.snapshot(),
-    };
   });
 
   // Wait-for helper (used by IPC commands)
