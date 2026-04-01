@@ -70,14 +70,16 @@ class GmcpHandler extends EventEmitter {
 
   // Register desired GMCP packages with the server
   // Call after receiving WILL GMCP
-  supportMessages() {
+  supportMessages(packages) {
+    // Accept dynamic package list from server profile, or fall back to defaults.
+    const pkgs = packages || [
+      'char 1', 'char.vitals 1', 'char.maxstats 1', 'char.status 1',
+      'room 1', 'room.info 1',
+      'comm 1', 'comm.channel 1',
+      'group 1',
+    ];
     return [
-      this.encode('Core.Supports.Set', [
-        'char 1', 'char.vitals 1', 'char.maxstats 1', 'char.status 1',
-        'room 1', 'room.info 1',
-        'comm 1', 'comm.channel 1',
-        'group 1',
-      ]),
+      this.encode('Core.Supports.Set', pkgs),
     ];
   }
 
@@ -175,9 +177,14 @@ class GmcpHandler extends EventEmitter {
       }
     }
 
+    // Emit with original case, lowercase, AND first-segment lowercase.
+    // This ensures handlers work regardless of whether the server sends
+    // "Char.Vitals" (IRE/Achaea) or "char.vitals" (Aardwolf).
+    const pkgLower = pkg.toLowerCase();
     this.emit('message', pkg, data);
     this.emit(pkg, data);
-    this.emit(pkg.split('.')[0], pkg, data); // e.g. 'char' for char.vitals
+    if (pkgLower !== pkg) this.emit(pkgLower, data); // lowercase alias
+    this.emit(pkgLower.split('.')[0], pkgLower, data); // e.g. 'char' for char.vitals
   }
 }
 

@@ -1,0 +1,131 @@
+{
+  "id": "batmud",
+  "name": "BatMUD",
+  "connection": {
+    "host": "bat.org",
+    "port": 23,
+    "loginDetect": "please enter your choice or name",
+    "passwordDetect": "password",
+    "inGameDetect": "Hp:\\d+\\/\\d+|Ep:\\d+|Exp:\\d+|obvious exit",
+    "enterPrompts": "press enter|more\\.\\.\\.",
+    "promptPattern": "Hp:(\\d+)\\/(\\d+) Sp:(\\d+)\\/(\\d+) Ep:(\\d+)\\/(\\d+) Exp:(\\d+)",
+    "promptFields": ["hp", "maxHp", "mana", "maxMana", "endurance", "maxEndurance", "xp"],
+    "quitCommands": ["quit"],
+    "debounceMs": 1000,
+    "extraLogin": [],
+    "keepalive": {
+      "command": "look",
+      "intervalMs": 600000
+    }
+  },
+  "gmcp": {
+    "packages": [],
+    "vitalsMap": {},
+    "channelFormat": "auto",
+    "stateMap": {}
+  },
+  "combat": {
+    "patterns": {
+      "mobDied": "(.+?) is DEAD, R\\.I\\.P|(.+?) dies",
+      "mobHitYou": "(.+?) (?:hits|claws|bites|slashes|pounds|smashes) you",
+      "youHitMob": "You (?:hit|claw|slash|pound|smash)",
+      "fleeSuccess": "You flee|You panic",
+      "notInCombat": "You are not in combat",
+      "mobFled": "flees in panic"
+    },
+    "idleTimeoutMs": 20000,
+    "cooldowns": {
+      "healMs": 5000,
+      "fleeMs": 8000
+    }
+  },
+  "parsing": {
+    "exitPattern": "Obvious exits?.*:",
+    "flavorFilters": [
+      "arrives from",
+      "leaves \\w+",
+      "wanders in from"
+    ],
+    "sceneryMobs": [],
+    "standingVerbs": "stands|sits|lurks|guards|watches|wanders|floats",
+    "playerMarker": null,
+    "promptLine": "Hp:\\d+\\/\\d+"
+  },
+  "commands": {
+    "move": {
+      "validDirections": [
+        "north", "south", "east", "west", "up", "down",
+        "n", "s", "e", "w", "u", "d",
+        "northeast", "northwest", "southeast", "southwest",
+        "ne", "nw", "se", "sw", "in", "out"
+      ],
+      "template": "{direction}"
+    },
+    "attack": { "template": "kill {target}" },
+    "look": { "template": "look", "targetTemplate": "look at {target}" },
+    "flee": { "template": "flee" },
+    "groupSay": { "template": "party say {message}" },
+    "heal": {
+      "default": "cast 'cure light wounds'"
+    },
+    "checkEquipment": "equipment",
+    "checkScore": "score",
+    "checkSkills": "skills",
+    "checkInventory": "inventory",
+    "autoPath": null
+  },
+  "resources": [
+    { "name": "hp", "max": "maxHp", "label": "Health" },
+    { "name": "mana", "max": "maxMana", "label": "Spell Points" },
+    { "name": "endurance", "max": "maxEndurance", "label": "Endurance" }
+  ],
+  "capabilities": {
+    "hasAutoPath": false,
+    "hasTrains": false,
+    "hasPractices": false,
+    "hasLessons": false,
+    "hasBalance": false,
+    "hasEquilibrium": false,
+    "hasGMCP": false,
+    "combatModel": "round",
+    "equipmentOutputPattern": "You are wearing:|You are wielding:"
+  },
+  "social": {
+    "patterns": {
+      "tell": "^(\\w+) tells you '(.+)'$",
+      "say": "^(\\w+) says '(.+)'$",
+      "newbie": "^(\\w+) \\[newbie\\]: (.+)$",
+      "party": "^(\\w+) \\[party\\]: (.+)$",
+      "enter": "^(\\w+) arrives from",
+      "emote": "^(\\w+) (nods|waves|grins|laughs|smiles)"
+    },
+    "channels": {
+      "tell": { "type": "direct", "obligation": "high" },
+      "say": { "type": "room", "obligation": "medium" },
+      "newbie": { "type": "global", "obligation": "low" },
+      "party": { "type": "group", "obligation": "medium" },
+      "enter": { "type": "system", "obligation": "none" },
+      "emote": { "type": "system", "obligation": "none" }
+    }
+  },
+  "defaults": {
+    "hp": 291,
+    "maxHp": 291,
+    "mana": 25,
+    "maxMana": 25,
+    "endurance": 188,
+    "maxEndurance": 188
+  },
+  "fieldTTLs": {
+    "hp": 120000,
+    "maxHp": 120000,
+    "mana": 120000,
+    "maxMana": 120000,
+    "endurance": 120000,
+    "maxEndurance": 120000,
+    "inCombat": 60000,
+    "currentRoom": 300000,
+    "gameState": 60000,
+    "recentEvents": 300000
+  }
+}

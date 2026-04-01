@@ -12,6 +12,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { atomicWriteJSON } = require('./atomic-write');
 
 class IpcServer {
   constructor(options = {}) {
@@ -80,18 +81,12 @@ class IpcServer {
       daemonState: this._getState(),
       timestamp: new Date().toISOString(),
     };
-    const filePath = path.join(this.ackDir, `${id}.json`);
-    const tmp = filePath + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(ack, null, 2));
-    fs.renameSync(tmp, filePath);
+    atomicWriteJSON(path.join(this.ackDir, `${id}.json`), ack);
   }
 
   // Write a result file (called by daemon after processing)
   writeResult(id, result) {
-    const filePath = path.join(this.resultsDir, `${id}.json`);
-    const tmp = filePath + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(result, null, 2));
-    fs.renameSync(tmp, filePath);
+    atomicWriteJSON(path.join(this.resultsDir, `${id}.json`), result);
   }
 
   // --- Internal ---
@@ -171,10 +166,7 @@ class IpcClient {
       label: options.label || null,
     };
 
-    const filePath = path.join(this.commandsDir, `${id}.json`);
-    const tmp = filePath + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(command, null, 2));
-    fs.renameSync(tmp, filePath);
+    atomicWriteJSON(path.join(this.commandsDir, `${id}.json`), command);
 
     return id;
   }

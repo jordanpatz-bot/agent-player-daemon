@@ -4,29 +4,11 @@
 
 const fs = require('fs');
 const path = require('path');
+const { atomicWrite } = require('./atomic-write');
 
-// Field categories with TTL (0 = durable, persists forever)
-const FIELD_TTLS = {
-  // Volatile — stale quickly
-  hp: 120000,           // 2 min
-  maxHp: 120000,
-  mana: 120000,
-  maxMana: 120000,
-  inCombat: 60000,      // 1 min
-  currentTarget: 60000,
-  combatRound: 60000,
-  currentRoom: 300000,  // 5 min
-  playersInRoom: 120000,
-  alertLevel: 300000,
-  momentum: 300000,
-
-  // Game state (Phase 2) — volatile
-  gameState: 60000,          // 1 min — stale = assume idle
-  recentEvents: 300000,      // 5 min
-  decisionNeeded: 60000,     // 1 min
-  decisionReason: 60000,
-
-  // Durable — persist across restarts
+// Durable fields that always persist (TTL = 0).
+// These are structural defaults that apply regardless of game server.
+const DURABLE_TTLS = {
   name: 0,
   level: 0,
   class: 0,
@@ -40,14 +22,9 @@ const FIELD_TTLS = {
   _warnedPlayers: 0,
 };
 
-const DEFAULTS = {
-  name: 'Mycelico',
-  level: 8,
-  class: 'ranger',
-  hp: 400,
-  maxHp: 400,
-  mana: 250,
-  maxMana: 250,
+// Structural defaults that apply regardless of game server.
+// Game-specific defaults (hp, mana, etc.) come from server profile + character profile.
+const STRUCTURAL_DEFAULTS = {
   inCombat: false,
   currentTarget: null,
   killCount: 0,
@@ -70,13 +47,27 @@ const DEFAULTS = {
   decisionReason: null,
 };
 
+// Legacy compatibility — kept so external code referencing DEFAULTS still works.
+const DEFAULTS = { ...STRUCTURAL_DEFAULTS };
+const FIELD_TTLS = { ...DURABLE_TTLS };
+
 class BlackboardStore {
   constructor(options = {}) {
     this.filePath = options.filePath || path.join(process.cwd(), 'blackboard.json');
     this.saveDebounceMs = options.saveDebounceMs || 5000;
-    // Profile-specific defaults override the hardcoded DEFAULTS.
-    // Fixes: all profiles falling back to 'Mycelico' on TTL expiry.
-    this._defaults = { ...DEFAULTS, ...(options.defaults || {}) };
+    // Merge defaults: structural → server profile → character profile overrides.
+    // Server profile provides game-specific defaults (hp, mana from server config).
+    // Character profile provides identity (name, level, class).
+    this._defaults = {
+      ...STRUCTURAL_DEFAULTS,
+      ...(options.serverDefaults || {}),
+      ...(options.defaults || {}),
+    };
+    // Merge TTLs: durable fields + server-specific volatile TTLs.
+    this._fieldTTLs = {
+      ...DURABLE_TTLS,
+      ...(options.fieldTTLs || {}),
+    };
     this._saveTimer = null;
     this._dirty = false;
     this._data = {};
@@ -86,7 +77,7 @@ class BlackboardStore {
 
   // Get a field value, returning default if expired
   get(field) {
-    const ttl = FIELD_TTLS[field];
+    const ttl = this._fieldTTLs[field];
     if (ttl && ttl > 0 && this._timestamps[field]) {
       const age = Date.now() - this._timestamps[field];
       if (age > ttl) {
@@ -119,7 +110,7 @@ class BlackboardStore {
     const now = Date.now();
     const snap = {};
     for (const field of Object.keys({ ...this._defaults, ...this._data })) {
-      const ttl = FIELD_TTLS[field];
+      const ttl = this._fieldTTLs[field];
       const ts = this._timestamps[field] || 0;
       const age = now - ts;
       const stale = ttl && ttl > 0 && age > ttl;
@@ -199,10 +190,7 @@ class BlackboardStore {
       savedAt: new Date().toISOString(),
     }, null, 2);
 
-    // Atomic write
-    const tmp = this.filePath + '.tmp';
-    fs.writeFileSync(tmp, payload);
-    fs.renameSync(tmp, this.filePath);
+    atomicWrite(this.filePath, payload);
     this._dirty = false;
   }
 

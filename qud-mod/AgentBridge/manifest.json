@@ -1,0 +1,7 @@
+{
+  "id": "AgentBridge",
+  "title": "Agent Bridge",
+  "description": "Exposes game state via file-based IPC for AI agent interaction. Reads commands from file, writes world state to JSON.",
+  "version": "1.0.0",
+  "gameversion": "2.0.207+"
+}

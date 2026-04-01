@@ -1,0 +1,79 @@
+{
+  "version": 2,
+  "description": "Aardwolf mage default reflexes",
+  "rules": [
+    {
+      "id": "emergency-flee",
+      "priority": 1,
+      "enabled": true,
+      "conditions": [
+        { "type": "hpPercent", "op": "<=", "value": 0.20 },
+        { "type": "inCombat" }
+      ],
+      "action": {
+        "command": "recall",
+        "failPatterns": ["you failed", "can't recall"],
+        "fallback": "flee"
+      },
+      "cooldown": 5000,
+      "description": "Emergency flee at 20% HP"
+    },
+    {
+      "id": "combat-heal-spell",
+      "priority": 2,
+      "enabled": true,
+      "conditions": [
+        { "type": "hpPercent", "op": "<=", "value": 0.50 },
+        { "type": "manaPercent", "op": ">=", "value": 0.10 },
+        { "type": "inCombat" }
+      ],
+      "action": {
+        "command": "cast 'cure light'",
+        "failPatterns": ["you don't have enough mana", "not enough mana"],
+        "fallback": "quaff heal"
+      },
+      "cooldown": 5000,
+      "description": "Self-heal with spell if mana available. Falls back to potion."
+    },
+    {
+      "id": "combat-heal-potion",
+      "priority": 3,
+      "enabled": true,
+      "conditions": [
+        { "type": "hpPercent", "op": "<=", "value": 0.50 },
+        { "type": "inCombat" }
+      ],
+      "action": {
+        "command": "quaff heal",
+        "failPatterns": ["you don't have that", "you do not have that"],
+        "fallback": "recall"
+      },
+      "cooldown": 5000,
+      "description": "Heal with potion when spell unavailable. Falls back to recall."
+    },
+    {
+      "id": "low-mana-rest",
+      "priority": 4,
+      "enabled": true,
+      "conditions": [
+        { "type": "manaPercent", "op": "<=", "value": 0.15 },
+        { "type": "notInCombat" }
+      ],
+      "action": { "command": "rest" },
+      "cooldown": 30000,
+      "description": "Rest when mana critically low outside combat"
+    },
+    {
+      "id": "idle-rest",
+      "priority": 5,
+      "enabled": true,
+      "conditions": [
+        { "type": "hpPercent", "op": "<=", "value": 0.40 },
+        { "type": "notInCombat" }
+      ],
+      "action": { "command": "rest" },
+      "cooldown": 30000,
+      "description": "Rest when HP low outside combat"
+    }
+  ]
+}

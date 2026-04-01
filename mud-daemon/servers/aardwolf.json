@@ -1,0 +1,179 @@
+{
+  "id": "aardwolf",
+  "name": "Aardwolf MUD",
+  "connection": {
+    "host": "aardmud.org",
+    "port": 4000,
+    "loginDetect": "what be thy name",
+    "passwordDetect": "password",
+    "inGameDetect": "\\d+hp\\s+\\d+.*mn\\s+\\d+.*mv",
+    "enterPrompts": "\\[press enter|press return",
+    "promptPattern": "\\[(\\d+)\\/(\\d+)hp\\s+(\\d+)\\/(\\d+)mn\\s+(\\d+)\\/(\\d+)mv\\s+(\\d+)qt\\s+(\\d+)tnl\\]",
+    "promptFields": ["hp", "maxHp", "mana", "maxMana", "moves", "maxMoves", "questPoints", "tnl"],
+    "quitCommands": ["quit quit", "y"],
+    "debounceMs": 800,
+    "extraLogin": [
+      { "detect": "already playing|do you wish to reconnect", "send": "y" }
+    ],
+    "keepalive": {
+      "command": "time",
+      "intervalMs": 600000
+    }
+  },
+  "gmcp": {
+    "packages": [
+      "char 1", "char.vitals 1", "char.maxstats 1", "char.status 1",
+      "char.base 1", "char.worth 1", "char.stats 1",
+      "room 1", "room.info 1",
+      "comm 1", "comm.channel 1",
+      "group 1"
+    ],
+    "vitalsMap": {
+      "hp": "hp", "maxhp": "maxHp",
+      "mana": "mana", "maxmana": "maxMana",
+      "moves": "moves", "maxmoves": "maxMoves"
+    },
+    "channelFormat": "double-encoded",
+    "stateMap": {
+      "1": "login",
+      "2": "motd",
+      "3": "idle",
+      "4": "afk",
+      "5": "note",
+      "6": "edit",
+      "7": "pager",
+      "8": "combat",
+      "9": "sleep",
+      "11": "resting",
+      "12": "sitting"
+    }
+  },
+  "combat": {
+    "patterns": {
+      "mobDied": "(.+?) is (?:slain|DEAD)",
+      "mobHitYou": "(.+?) (?:hits|misses|scratches|grazes|nicks|injures|wounds|mauls|decimates|devastates|maims|MUTILATES|DISEMBOWELS|DISMEMBERS|MASSACRES|MANGLES|\\*\\*\\* DEMOLISHES|\\*\\*\\* DEVASTATES|=== OBLITERATES|>>> ANNIHILATES|>>> ERADICATES|claws|bites|stings|whips|slashes|pierces|pounds|crushes|blasts) you",
+      "youHitMob": "Your (.+?) (?:hits|misses|scratches|grazes|nicks|injures|wounds|mauls|decimates|devastates|maims|MUTILATES|DISEMBOWELS|DISMEMBERS|MASSACRES|MANGLES|\\*\\*\\* DEMOLISHES|\\*\\*\\* DEVASTATES|=== OBLITERATES|>>> ANNIHILATES|>>> ERADICATES|claws|bites|stings|whips|slashes|pierces|pounds|crushes|blasts)",
+      "fleeSuccess": "You flee from combat|You recall",
+      "notInCombat": "You aren't fighting anyone|Not while you are fighting",
+      "mobFled": "turns tail and runs|flees from combat",
+      "levelUp": "congratulations.*level|you have gained a level|CONGRATULATIONS"
+    },
+    "idleTimeoutMs": 15000,
+    "cooldowns": {
+      "healMs": 5000,
+      "fleeMs": 10000
+    }
+  },
+  "parsing": {
+    "exitPattern": "\\[ Exits: (.+?) \\]",
+    "flavorFilters": [
+      "startled by",
+      "scampers? (?:off|away)",
+      "runs? away",
+      "disappears?",
+      "leaves? (?:heading |going )?(?:north|south|east|west|up|down)",
+      "arrives? from",
+      "your presence",
+      "flies? (?:off|away)",
+      "darts? (?:off|away|into)",
+      "slips? (?:away|into)",
+      "has arrived",
+      "just left",
+      "^\\(Player\\)",
+      "^\\(Charmed\\)",
+      "^\\(Animated\\)"
+    ],
+    "sceneryMobs": ["grasshopper"],
+    "standingVerbs": "waddles|slithers|glides|lurks|prowls|stands|sits|crawls|hops|coils|rests|waits|watches|guards|circles|paces|flutters|flexes|threatens|wanders|roams|floats|hovers|shambles|staggers|gnaws|snarls|growls|looms|shuffles|flies|scurries|twitches|lopes|eats|bounces|burrows|digs|sleeps|plays|swims|hunts|feeds|grazes",
+    "playerMarker": "^\\(Player\\)",
+    "promptLine": "^\\[.*hp.*mn.*mv"
+  },
+  "commands": {
+    "move": {
+      "validDirections": [
+        "north", "south", "east", "west", "up", "down",
+        "n", "s", "e", "w", "u", "d",
+        "northeast", "northwest", "southeast", "southwest",
+        "ne", "nw", "se", "sw"
+      ],
+      "template": "{direction}"
+    },
+    "attack": { "template": "kill {target}" },
+    "look": { "template": "look", "targetTemplate": "look {target}" },
+    "flee": { "template": "recall" },
+    "groupSay": { "template": "gt {message}" },
+    "heal": {
+      "warrior": "quaff heal",
+      "mage": "cast 'cure light'",
+      "thief": "quaff heal",
+      "cleric": "cast 'heal'",
+      "ranger": "cast 'cure light'",
+      "paladin": "cast 'cure light'",
+      "psi": "quaff heal",
+      "default": "quaff heal"
+    },
+    "checkEquipment": "equipment",
+    "checkScore": "score",
+    "checkSkills": "practice",
+    "checkInventory": "inventory",
+    "autoPath": "runto {destination}"
+  },
+  "resources": [
+    { "name": "hp", "max": "maxHp", "label": "Health" },
+    { "name": "mana", "max": "maxMana", "label": "Mana" },
+    { "name": "moves", "max": "maxMoves", "label": "Moves" }
+  ],
+  "capabilities": {
+    "hasAutoPath": true,
+    "hasTrains": true,
+    "hasPractices": true,
+    "hasLessons": false,
+    "hasBalance": false,
+    "hasEquilibrium": false,
+    "combatModel": "round",
+    "equipmentOutputPattern": "You are using:"
+  },
+  "social": {
+    "patterns": {
+      "tell": "^(\\w+) tells you '(.+)'$",
+      "say": "^(\\w+) says '(.+)'$",
+      "gossip": "^\\[(\\w+)\\] (\\w+): (.+)$",
+      "groupSay": "^\\(Group\\) (\\w+): '(.+)'$",
+      "newbie": "^\\[Newbie\\] (\\w+): (.+)$",
+      "enter": "^\\(Player\\) (\\w+)",
+      "emote": "^(\\w+) (nods|waves|grins|laughs|smiles|chuckles)"
+    },
+    "channels": {
+      "tell": { "type": "direct", "obligation": "high" },
+      "say": { "type": "room", "obligation": "medium" },
+      "gossip": { "type": "global", "obligation": "low" },
+      "groupSay": { "type": "group", "obligation": "medium" },
+      "newbie": { "type": "global", "obligation": "low" },
+      "enter": { "type": "system", "obligation": "none" },
+      "emote": { "type": "system", "obligation": "none" }
+    }
+  },
+  "defaults": {
+    "hp": 100,
+    "maxHp": 100,
+    "mana": 100,
+    "maxMana": 100,
+    "moves": 500,
+    "maxMoves": 500
+  },
+  "fieldTTLs": {
+    "hp": 120000,
+    "maxHp": 120000,
+    "mana": 120000,
+    "maxMana": 120000,
+    "moves": 120000,
+    "maxMoves": 120000,
+    "inCombat": 60000,
+    "currentTarget": 60000,
+    "currentRoom": 300000,
+    "gameState": 60000,
+    "recentEvents": 300000,
+    "decisionNeeded": 60000,
+    "decisionReason": 60000
+  }
+}

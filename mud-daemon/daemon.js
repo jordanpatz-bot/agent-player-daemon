@@ -12,15 +12,27 @@
 const fs = require('fs');
 const path = require('path');
 const { MudConnection } = require('./connection');
+const { QudConnection } = require('./qud-connection');
 const { BlackboardStore } = require('./blackboard-store');
 const { IpcServer } = require('./ipc');
 const { ConnectionStateMachine } = require('./state-machine');
 const { OutputBuffer } = require('./output-buffer');
 const { GmcpHandler } = require('./gmcp');
 const { GameStateEngine } = require('./game-state');
+const { loadServerProfile } = require('./server-profile');
+const { WorldModel } = require('./world-model');
+const { WorldModelBridge } = require('./world-model-bridge');
+const { ReflexEngine } = require('./reflex-engine');
+const { SharedState } = require('./shared-state');
+const { TacticsEngine } = require('./tactics');
+const { StateAudit } = require('./state-audit');
+const { BehaviorTree } = require('./behavior-tree');
+const { ConversationMiddleware } = require('./conversation-middleware');
+const { atomicWriteJSON } = require('./atomic-write');
+const { createIpcHandler } = require('./ipc-handler');
 
-// --- Game server templates ---
-const SERVERS = {
+// --- Minimal inline fallbacks (used only when server JSON is missing) ---
+const FALLBACK_SERVERS = {
   aardwolf: {
     host: 'aardmud.org',
     port: 4000,
@@ -56,22 +68,29 @@ const SERVERS = {
 // Credentials loaded from profiles.json if it exists, otherwise defaults here.
 function loadProfiles() {
   const profilePath = path.join(__dirname, 'profiles.json');
-  if (fs.existsSync(profilePath)) {
-    const raw = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
-    // Merge server templates with profile credentials
-    const merged = {};
-    for (const [key, profile] of Object.entries(raw)) {
-      const server = SERVERS[profile.server];
-      if (!server) continue;
-      merged[key] = { ...server, ...profile };
-    }
-    return merged;
+  if (!fs.existsSync(profilePath)) {
+    console.error('[WARN] profiles.json not found — no profiles available');
+    return {};
   }
-  // Fallback defaults
-  return {
-    mycelico: { ...SERVERS.aardwolf, name: 'Mycelico', pass: 'spore2network', owner: 'mico', server: 'aardwolf' },
-    rhizomi: { ...SERVERS.discworld, name: 'Rhizomi', pass: 'spore2flatworld', owner: 'rhizo', server: 'discworld' },
-  };
+  const raw = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
+  // Merge server profile with profile credentials
+  const merged = {};
+  for (const [key, profile] of Object.entries(raw)) {
+    const serverProfile = loadServerProfile(profile.server);
+    if (serverProfile) {
+      merged[key] = { ...serverProfile.toGameConfig(profile), _serverProfile: serverProfile };
+    } else {
+      // Fallback: server JSON missing, use inline defaults with warning
+      const fallback = FALLBACK_SERVERS[profile.server];
+      if (!fallback) {
+        console.error(`[WARN] No server profile or fallback for "${profile.server}" — skipping profile "${key}"`);
+        continue;
+      }
+      console.error(`[WARN] Server JSON missing for "${profile.server}" — using inline fallback`);
+      merged[key] = { ...fallback, ...profile, _serverProfile: null };
+    }
+  }
+  return merged;
 }
 
 // --- Parse args ---
@@ -130,6 +149,8 @@ async function main() {
     process.exit(1);
   }
 
+  const serverProfile = gameConfig._serverProfile || null;
+
   const dataDir = path.join(__dirname, 'data', profileKey);
   fs.mkdirSync(dataDir, { recursive: true });
 
@@ -150,6 +171,8 @@ async function main() {
       level: gameConfig.level || 1,
       class: gameConfig.class || 'unknown',
     },
+    serverDefaults: serverProfile ? serverProfile.defaults : {},
+    fieldTTLs: serverProfile ? serverProfile.fieldTTLs : {},
   });
 
   // Seed blackboard identity from profile config on first run or after reset.
@@ -177,33 +200,176 @@ async function main() {
 
   const gmcp = new GmcpHandler();
 
+  // --- World Model (Phase 2) ---
+  // Structured entity/room/timeline model. Perception-agnostic.
+  const worldModel = new WorldModel({
+    persistPath: path.join(dataDir, 'world-model.json'),
+    name: gameConfig.name || profileKey,
+    level: gameConfig.level || 1,
+    class: gameConfig.class || 'unknown',
+    subclass: gameConfig.subclass || '',
+    race: gameConfig.race || 'unknown',
+  });
+
+  const bridge = new WorldModelBridge({
+    worldModel,
+    serverProfile,
+    log,
+  });
+
+  // Wire GMCP events through the bridge into the world model.
+  // This handles: char.vitals, char.status, char.maxstats, char.base,
+  // char.worth, room.info, group, comm.channel, comm.quest
+  bridge.wireGmcp(gmcp);
+
   // --- Game State Engine (Phase 2) ---
   // Layers on connection state machine: tracks idle/combat/exploring/resting,
   // runs reflexes (auto-heal, auto-flee), logs events to blackboard.
   const gameState = new GameStateEngine({
     blackboard,
+    serverProfile,
+    characterClass: gameConfig.class,
     log,
   });
 
-  // Wire reflex actions — when the engine triggers a reflex, send it to the MUD.
-  // Reflexes are combat-gated and mutex-gated inside GameStateEngine.
-  gameState.on('reflex', (cmd) => {
+  // --- Reflex Engine (Phase 3) ---
+  // JSON-driven, hot-reloadable rule engine. Replaces hardcoded reflexes.
+  const reflexEngine = new ReflexEngine({
+    worldModel,
+    log,
+  });
+
+  // Load class-specific reflex rules
+  const reflexPath = path.join(__dirname, 'reflexes',
+    `${gameConfig.server || 'aardwolf'}-${(gameConfig.class || 'warrior').toLowerCase()}.json`);
+  if (fs.existsSync(reflexPath)) {
+    reflexEngine.watchRules(reflexPath);
+  } else {
+    log('SYS', `No reflex rules found at ${reflexPath} — reflexes disabled`);
+  }
+
+  // Wire reflex actions — when a rule fires, send the command to the MUD.
+  reflexEngine.on('action', (cmd, rule) => {
     if (connection.isPlaying()) {
       connection.send(cmd);
-      log('REFLEX', `Sent: "${cmd}"`);
+      log('REFLEX', `Rule "${rule.id}": ${cmd}`);
+    }
+  });
+
+  // --- Behavior Tree (tactical brain) ---
+  // Replaces reflex engine as the primary reactive system.
+  // LLM authors trees in JSON; daemon ticks them on every world model update.
+  const behaviorTree = new BehaviorTree({
+    worldModel,
+    sharedState: null, // set after sharedState is created
+    log,
+  });
+
+  // Load class-specific behavior tree
+  const treePath = path.join(__dirname, 'trees',
+    `${gameConfig.server || 'aardwolf'}-${(gameConfig.class || 'warrior').toLowerCase()}.json`);
+  if (fs.existsSync(treePath)) {
+    behaviorTree.watchFile(treePath);
+  } else {
+    log('SYS', `No behavior tree at ${treePath} — using reflex engine only`);
+  }
+
+  // Wire behavior tree actions — same as reflex engine, send commands to MUD
+  behaviorTree.on('action', (cmd, node) => {
+    if (connection.isPlaying()) {
+      connection.send(cmd);
+      log('BT', `${node._id || node.name}: ${cmd}`);
+    }
+  });
+
+  // Wire escalation — behavior tree signals LLM needs to decide something
+  behaviorTree.on('escalate', (info) => {
+    log('BT-ESCALATE', `${info.reason}`);
+    worldModel.recordEvent({
+      type: 'escalation',
+      detail: info.reason,
+    });
+  });
+
+  // Tick both systems on world model changes.
+  // Behavior tree is primary; reflex engine is fallback for simple rules.
+  worldModel.on('self:changed', () => {
+    const btResult = behaviorTree.tick();
+    // Only run reflex engine if behavior tree didn't act
+    if (btResult !== 'SUCCESS') {
+      reflexEngine.evaluate('vitals');
     }
   });
 
   gameState.on('transition', ({ from, to, reason }) => {
     log('GAME', `State: ${from} → ${to} (${reason})`);
+    // When combat ends, unsuppress reflex rules (player may have bought new potions)
+    if (from === 'combat' && to !== 'combat') {
+      reflexEngine.unsuppressAll();
+    }
   });
 
-  const connection = new MudConnection(gameConfig, {
-    // Pipe raw socket bytes through GMCP handler before text cleaning.
-    // gmcp.processRaw extracts GMCP subnegotiations, emits events,
-    // and returns remaining bytes for normal text processing.
-    rawPreprocessor: (buf) => gmcp.processRaw(buf),
+  // Wire game state transitions into world model
+  bridge.wireGameState(gameState);
+
+  // --- Shared State & Tactics (Phase 4) ---
+  const sharedState = new SharedState({
+    profileKey,
+    serverName: gameConfig.server || 'aardwolf',
+    log,
   });
+
+  const tactics = new TacticsEngine({
+    worldModel,
+    sharedState,
+    reflexEngine,
+    serverProfile,
+    log,
+  });
+
+  // Pass shared state to reflex engine and behavior tree for group-aware conditions
+  reflexEngine.sharedState = sharedState;
+  behaviorTree.sharedState = sharedState;
+
+  // --- State Audit (self-awareness system) ---
+  const audit = new StateAudit({
+    worldModel,
+    serverProfile,
+    persistPath: path.join(dataDir, 'audit-state.json'),
+    log,
+  });
+
+  // --- Conversation Middleware (social metabolism) ---
+  const conversation = new ConversationMiddleware({
+    worldModel,
+    serverProfile,
+    characterName: gameConfig.name,
+    log,
+  });
+
+  // Wire conversation responses — delayed send to MUD
+  conversation.on('speak', ({ command }) => {
+    if (connection.isPlaying()) {
+      connection.send(command);
+      log('SOCIAL', `Sent: "${command}"`);
+    }
+  });
+
+  // Wire obligation escalation to behavior tree
+  conversation.on('obligation:high', (obligation) => {
+    worldModel.recordEvent({
+      type: 'social_obligation',
+      detail: `${obligation.speaker}: ${(obligation.content || '').substring(0, 50)}`,
+    });
+  });
+
+  // Create connection based on type — TCP for MUDs, file-IPC for Qud
+  const isFileIpc = serverProfile && serverProfile.connectionType === 'file-ipc';
+  const connection = isFileIpc
+    ? new QudConnection(gameConfig, { dataDir: path.join(dataDir, 'ipc') })
+    : new MudConnection(gameConfig, {
+        rawPreprocessor: (buf) => gmcp.processRaw(buf),
+      });
 
   function log(type, msg) {
     const ts = new Date().toISOString().substring(11, 19);
@@ -228,29 +394,28 @@ async function main() {
       profile: profileKey,
       connectionState: stateMachine.getState(),
       playingUptime: stateMachine.getUptime(),
-      blackboard: {
-        hp: blackboard.get('hp'),
-        maxHp: blackboard.get('maxHp'),
-        killCount: blackboard.get('killCount'),
-        currentRoom: blackboard.get('currentRoom'),
+      character: {
+        hp: worldModel.self.hp,
+        maxHp: worldModel.self.maxHp,
+        killCount: worldModel.self.killCount,
+        location: worldModel.self.locationId,
+        room: worldModel.getCurrentRoom(),
       },
       recentEvents: digestEvents.slice(-20),
       timestamp: new Date().toISOString(),
     };
-    const tmp = path.join(dataDir, 'digest.json.tmp');
-    const dest = path.join(dataDir, 'digest.json');
-    try {
-      fs.writeFileSync(tmp, JSON.stringify(digest, null, 2));
-      fs.renameSync(tmp, dest);
-    } catch { /* non-fatal */ }
+    try { atomicWriteJSON(path.join(dataDir, 'digest.json'), digest); }
+    catch { /* non-fatal */ }
   }
 
   // --- Wire connection events ---
   connection.on('connected', () => {
     log('SYS', `Connected to ${gameConfig.host}:${gameConfig.port}`);
     stateMachine.transition('connecting');
-    // Send GMCP negotiation
-    connection.socket.write(gmcp.negotiateOn());
+    // Send GMCP negotiation (TCP only — file-IPC has no socket)
+    if (!isFileIpc && connection.socket) {
+      connection.socket.write(gmcp.negotiateOn());
+    }
   });
 
   connection.on('loggedIn', () => {
@@ -258,6 +423,9 @@ async function main() {
     stateMachine.transition('login');   // connecting → login (required intermediate)
     stateMachine.transition('playing'); // login → playing
     recordDigestEvent('login', 'Connected and in game');
+
+    // Start shared state publishing for multi-agent coordination
+    sharedState.start(2000);
   });
 
   connection.on('disconnected', ({ wasPlaying }) => {
@@ -282,29 +450,25 @@ async function main() {
 
   // --- GMCP events ---
   gmcp.on('gmcp-ready', () => {
+    if (isFileIpc) return; // No GMCP for file-IPC connections
     log('GMCP', 'Server supports GMCP — registering packages');
-    for (const msg of gmcp.supportMessages()) {
+    for (const msg of gmcp.supportMessages(serverProfile ? serverProfile.gmcpPackages : undefined)) {
       connection.socket.write(msg);
     }
   });
 
   gmcp.on('char.vitals', (data) => {
-    const hp = parseInt(data.hp) || blackboard.get('hp');
-    const maxHp = parseInt(data.maxhp) || blackboard.get('maxHp');
-    const mana = parseInt(data.mana) || blackboard.get('mana');
-    const maxMana = parseInt(data.maxmana) || blackboard.get('maxMana');
-    blackboard.update({ hp, maxHp, mana, maxMana });
-    // Feed vitals to game state engine for reflex evaluation
+    // Vitals go to world model via bridge.wireGmcp(). Feed to game state for reflexes.
+    const hp = parseInt(data.hp) || worldModel.self.hp;
+    const maxHp = parseInt(data.maxhp) || worldModel.self.maxHp;
+    const mana = parseInt(data.mana) || worldModel.self.mana;
+    const maxMana = parseInt(data.maxmana) || worldModel.self.maxMana;
     gameState.processVitals(hp, maxHp, mana, maxMana);
   });
 
   gmcp.on('room.info', (data) => {
+    // Room data goes to world model via bridge.wireGmcp().
     log('GMCP', `Room: ${data.name || 'unknown'} [${data.zone || 'unknown'}]`);
-    blackboard.set('currentRoom', {
-      name: data.name || 'unknown',
-      zone: data.zone || 'unknown',
-      exits: data.exits ? Object.keys(data.exits) : [],
-    });
   });
 
   // Log all GMCP messages for visibility (can be removed once stable)
@@ -313,127 +477,88 @@ async function main() {
   });
 
   gmcp.on('comm.channel', (data) => {
-    recordDigestEvent('channel', `[${data.chan}] ${data.player}: ${(data.msg || '').substring(0, 100)}`);
+    // Channel format varies by game — use config to determine parsing
+    const format = serverProfile ? serverProfile.gmcpChannelFormat : 'auto';
+    let parsed = data;
+    if (format === 'double-encoded' || (format === 'auto' && typeof data === 'string')) {
+      try { parsed = JSON.parse(data); } catch { return; }
+    }
+    const channel = parsed && (parsed.chan || parsed.channel);
+    const player = parsed && (parsed.player || parsed.talker);
+    if (channel && player) {
+      const msg = (parsed.msg || parsed.text || '').replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim();
+      recordDigestEvent('channel', `[${channel}] ${player}: ${msg.substring(0, 100)}`);
+    }
   });
 
+  // --- Wire file-IPC perception (visual games) ---
+  if (isFileIpc) {
+    bridge.wireFileIpc(connection);
+  }
+
   // --- Wire data pipeline ---
-  connection.on('data', (text) => {
+  connection.on('data', (data) => {
+    // File-IPC data is handled by bridge.wireFileIpc() — skip text pipeline
+    if (isFileIpc) return;
+
+    // MUD text pipeline (existing behavior)
+    const text = data;
     outputBuffer.append(text);
 
     // Feed text to game state engine for state detection + reflexes
     gameState.processText(text);
 
+    // Feed text to world model bridge for kill/level tracking
+    bridge.processText(text);
+
+    // Feed text to reflex engine for failure detection (e.g., "You don't have that potion")
+    reflexEngine.processText(text);
+
+    // Feed text to state audit for context capture (equipment, score, train output)
+    audit.processText(text);
+
+    // Feed text to conversation middleware for social classification + obligation scoring
+    conversation.processText(text);
+
     // Fallback: regex HP prompt parsing (when GMCP not available)
-    if (gameConfig.promptPattern) {
-      const m = text.match(gameConfig.promptPattern);
-      if (m) {
+    const pattern = serverProfile ? serverProfile.connection.promptPattern : gameConfig.promptPattern;
+    if (pattern) {
+      const m = text.match(pattern);
+      if (m && serverProfile) {
+        const fields = serverProfile.connection.promptFields;
+        const values = {};
+        fields.forEach((field, i) => {
+          values[field] = parseInt(m[i + 1]) || 0;
+        });
+        worldModel.updateSelf(values);
+        if (values.hp !== undefined && values.maxHp !== undefined) {
+          gameState.processVitals(values.hp, values.maxHp, values.mana, values.maxMana);
+        }
+      } else if (m) {
+        // Legacy fallback: positional groups (hp, maxHp, mana, maxMana)
         const hp = parseInt(m[1]);
         const maxHp = parseInt(m[2]);
         const mana = parseInt(m[3]);
         const maxMana = parseInt(m[4]);
-        blackboard.update({ hp, maxHp, mana, maxMana });
-        // Feed prompt-parsed vitals to game state engine too
+        worldModel.updateSelf({ hp, maxHp, mana, maxMana });
         gameState.processVitals(hp, maxHp, mana, maxMana);
       }
     }
 
     // Track kills for digest
     if (/is slain|is DEAD/i.test(text)) {
-      const count = (blackboard.get('killCount') || 0) + 1;
-      blackboard.set('killCount', count);
-      recordDigestEvent('kill', `Kill #${count}`);
+      worldModel.self.killCount = (worldModel.self.killCount || 0) + 1;
+      recordDigestEvent('kill', `Kill #${worldModel.self.killCount}`);
     }
   });
 
   // --- Wire IPC ---
-  ipc.onCommand(async (command) => {
-    log('IPC', `Received command: ${command.id} (${command.commands.length} cmds)`);
-
-    if (!connection.isPlaying()) {
-      return {
-        output: '',
-        error: 'Not connected to game',
-        connectionState: connection.getState(),
-      };
-    }
-
-    // Acquire mutex — prevents reflexes from interleaving with IPC commands
-    gameState.acquireMutex();
-
-    // Use cursor-based tracking that survives ring buffer wrapping.
-    const startCursor = outputBuffer.getCursor();
-    const events = [];
-
-    try {
-      // Send each command with delay
-      for (let i = 0; i < command.commands.length; i++) {
-        const cmd = command.commands[i];
-
-        if (typeof cmd === 'string') {
-          connection.send(cmd);
-          log('IPC', `Sent: "${cmd}"`);
-          await new Promise(r => setTimeout(r, 1500));
-        } else if (typeof cmd === 'object' && cmd.wait) {
-          // Wait-for pattern
-          const matched = await waitForPattern(cmd.wait, cmd.timeout || 15000);
-          log('IPC', matched ? `Wait matched: ${cmd.wait}` : `Wait timed out: ${cmd.wait}`);
-          if (cmd.send) {
-            connection.send(cmd.send);
-            await new Promise(r => setTimeout(r, 1500));
-          }
-        } else if (typeof cmd === 'object' && cmd.action) {
-          // Typed command — translate and send
-          const result = gameState.translateCommand(cmd);
-          if (result.error) {
-            log('IPC', `Typed command rejected: ${result.error}`);
-            events.push({ type: 'command_error', detail: result.error });
-          } else {
-            connection.send(result.command);
-            log('IPC', `Typed [${cmd.action}] → "${result.command}"`);
-            await new Promise(r => setTimeout(r, 1500));
-          }
-        }
-      }
-
-      // Collect output since command started
-      await new Promise(r => setTimeout(r, 2000)); // settle time
-      const newOutput = outputBuffer.getOutputSince(startCursor);
-
-      // Clear decision flag — agent has responded by sending commands
-      gameState.clearDecision();
-
-      return {
-        output: newOutput.slice(-5000), // cap at 5KB
-        events,
-        state: stateMachine.getState(),
-        gameState: gameState.snapshot(),
-        blackboard: blackboard.snapshot(),
-      };
-    } finally {
-      // Always release mutex, even on error
-      gameState.releaseMutex();
-    }
-  });
-
-  // Wait-for helper (used by IPC commands)
-  function waitForPattern(pattern, timeoutMs) {
-    return new Promise((resolve) => {
-      const re = typeof pattern === 'string' ? new RegExp(pattern, 'i') : pattern;
-      const startCursor = outputBuffer.getCursor();
-      const deadline = Date.now() + timeoutMs;
-
-      const check = setInterval(() => {
-        const newText = outputBuffer.getOutputSince(startCursor);
-        if (re.test(newText)) {
-          clearInterval(check);
-          resolve(true);
-        } else if (Date.now() > deadline) {
-          clearInterval(check);
-          resolve(false);
-        }
-      }, 200);
-    });
-  }
+  ipc.onCommand(createIpcHandler({
+    connection, isFileIpc, dataDir, log,
+    reflexEngine, worldModel, tactics, behaviorTree,
+    conversation, audit, gameState, stateMachine,
+    blackboard, outputBuffer,
+  }));
 
   // --- Status endpoint (write periodic status file) ---
   function writeStatus() {
@@ -444,27 +569,49 @@ async function main() {
       connectionState: connection.getState(),
       gameState: stateMachine.getState(),
       reconnectAttempts: connection.reconnectAttempts,
-      blackboard: {
-        hp: blackboard.get('hp'),
-        maxHp: blackboard.get('maxHp'),
-        mana: blackboard.get('mana'),
-        maxMana: blackboard.get('maxMana'),
-        inCombat: blackboard.get('inCombat'),
-        killCount: blackboard.get('killCount'),
-        currentRoom: blackboard.get('currentRoom'),
+      character: {
+        hp: worldModel.self.hp,
+        maxHp: worldModel.self.maxHp,
+        mana: worldModel.self.mana,
+        maxMana: worldModel.self.maxMana,
+        inCombat: worldModel.self.inCombat,
+        killCount: worldModel.self.killCount,
+        location: worldModel.self.locationId,
+        room: worldModel.getCurrentRoom(),
       },
       stateHistory: stateMachine.getHistory().slice(-5),
       timestamp: new Date().toISOString(),
     };
 
-    const tmp = path.join(dataDir, 'status.json.tmp');
-    const dest = path.join(dataDir, 'status.json');
-    fs.writeFileSync(tmp, JSON.stringify(status, null, 2));
-    fs.renameSync(tmp, dest);
+    atomicWriteJSON(path.join(dataDir, 'status.json'), status);
   }
 
   const statusTimer = setInterval(writeStatus, 15000);
   const digestTimer = setInterval(writeDigest, 900000); // 15 min digest
+
+  // Publish shared state for multi-agent coordination (Phase 4)
+  const sharedStateTimer = setInterval(() => {
+    if (connection.isPlaying()) {
+      sharedState.publishState({
+        name: worldModel.self.name,
+        class: worldModel.self.class,
+        role: tactics.getRole(),
+        location: worldModel.getCurrentRoom() ? {
+          id: worldModel.self.locationId,
+          name: worldModel.getCurrentRoom().name,
+          zone: worldModel.getCurrentRoom().zone,
+        } : null,
+        hp: worldModel.self.hp,
+        maxHp: worldModel.self.maxHp,
+        mana: worldModel.self.mana,
+        maxMana: worldModel.self.maxMana,
+        moves: worldModel.self.moves,
+        inCombat: worldModel.self.inCombat,
+        target: worldModel.self.currentTarget,
+        gameState: worldModel.self.state,
+      });
+    }
+  }, 2000);
 
   // --- Graceful shutdown ---
   function shutdown(signal) {
@@ -477,7 +624,12 @@ async function main() {
     outputBuffer.stopSnapshots();
     clearInterval(statusTimer);
     clearInterval(digestTimer);
+    reflexEngine.stopWatching();
+    behaviorTree.stopWatching();
+    sharedState.stop();
+    clearInterval(sharedStateTimer);
     blackboard.saveNow();
+    worldModel.saveNow();
     writeStatus();
     writeDigest();
 
@@ -508,17 +660,18 @@ async function main() {
   await new Promise(resolve => setTimeout(resolve, 3000));
   connection.connect();
 
-  // Keepalive — send a no-op command every 10 minutes to prevent idle timeout.
-  // Aardwolf kicks idle connections after ~35 minutes; this keeps us under that.
-  // Only fires when connected and playing. The command 'time' is silent and harmless.
-  const KEEPALIVE_MS = 10 * 60 * 1000; // 10 minutes
-  const KEEPALIVE_CMD = gameConfig.server === 'discworld' ? 'date' : 'time';
-  setInterval(() => {
-    if (connection.isPlaying()) {
-      connection.send(KEEPALIVE_CMD);
-      log('SYS', `Keepalive sent: ${KEEPALIVE_CMD}`);
-    }
-  }, KEEPALIVE_MS);
+  // Keepalive — send a no-op command periodically to prevent idle timeout.
+  // File-IPC connections don't need keepalive (no TCP idle disconnect).
+  if (!isFileIpc) {
+    const KEEPALIVE_MS = serverProfile ? serverProfile.connection.keepalive.intervalMs : 10 * 60 * 1000;
+    const KEEPALIVE_CMD = serverProfile ? serverProfile.connection.keepalive.command : 'time';
+    setInterval(() => {
+      if (connection.isPlaying()) {
+        connection.send(KEEPALIVE_CMD);
+        log('SYS', `Keepalive sent: ${KEEPALIVE_CMD}`);
+      }
+    }, KEEPALIVE_MS);
+  }
 }
 
 main().catch(err => {

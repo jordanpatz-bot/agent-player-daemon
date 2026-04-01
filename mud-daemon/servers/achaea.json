@@ -1,0 +1,148 @@
+{
+  "id": "achaea",
+  "name": "Achaea, Dreams of Divine Lands",
+  "connection": {
+    "host": "achaea.com",
+    "port": 23,
+    "loginDetect": "enter the game",
+    "passwordDetect": "password",
+    "inGameDetect": "\\d+h, \\d+m|Balance|Equilibrium|You are standing",
+    "enterPrompts": "\\[press enter|ENTER to continue|more\\]",
+    "promptPattern": "(\\d+)h, (\\d+)m, (\\d+)e, (\\d+)w",
+    "promptFields": ["hp", "mana", "endurance", "willpower"],
+    "quitCommands": ["QUIT YES"],
+    "debounceMs": 800,
+    "extraLogin": [
+      { "detect": "Press ENTER to continue", "send": "" }
+    ],
+    "keepalive": {
+      "command": "CONFIG",
+      "intervalMs": 600000
+    }
+  },
+  "gmcp": {
+    "packages": [
+      "Char 1", "Char.Vitals 1", "Char.Status 1", "Char.Items 1",
+      "Char.Afflictions 1", "Char.Defences 1", "Char.Skills 1",
+      "Room 1", "Room.Info 1",
+      "Comm 1", "Comm.Channel 1",
+      "IRE.Target 1", "IRE.Time 1", "IRE.Tasks 1", "IRE.Rift 1"
+    ],
+    "vitalsMap": {
+      "hp": "hp", "maxhp": "maxHp",
+      "mp": "mana", "maxmp": "maxMana",
+      "ep": "endurance", "maxep": "maxEndurance",
+      "wp": "willpower", "maxwp": "maxWillpower",
+      "nl": "tnl", "bal": "balance", "eq": "equilibrium"
+    },
+    "channelFormat": "object",
+    "stateMap": {}
+  },
+  "combat": {
+    "patterns": {
+      "mobDied": "(.+?) has been slain|(.+?) crumbles to dust",
+      "mobHitYou": "(.+?) (?:hits|strikes|slashes|smashes|bashes|kicks|punches) you",
+      "youHitMob": "You (?:hit|strike|slash|smash|bash|kick|punch)",
+      "fleeSuccess": "You flee|You retreat",
+      "notInCombat": "You aren't fighting anyone",
+      "mobFled": "flees to the"
+    },
+    "idleTimeoutMs": 20000,
+    "cooldowns": {
+      "healMs": 4000,
+      "fleeMs": 8000
+    }
+  },
+  "parsing": {
+    "exitPattern": "You see (?:a single exit|exits) leading|Exits:",
+    "flavorFilters": [
+      "arrives from the",
+      "leaves to the",
+      "has entered the",
+      "has left the"
+    ],
+    "sceneryMobs": [],
+    "standingVerbs": "stands|lurks|prowls|guards|watches|paces|looms|waits",
+    "playerMarker": null,
+    "promptLine": "\\d+h, \\d+m"
+  },
+  "commands": {
+    "move": {
+      "validDirections": [
+        "north", "south", "east", "west", "up", "down",
+        "n", "s", "e", "w", "u", "d",
+        "northeast", "northwest", "southeast", "southwest",
+        "ne", "nw", "se", "sw", "in", "out"
+      ],
+      "template": "{direction}"
+    },
+    "attack": { "template": "kill {target}" },
+    "look": { "template": "look", "targetTemplate": "look {target}" },
+    "flee": { "template": "FLEE" },
+    "groupSay": { "template": "pt {message}" },
+    "heal": {
+      "default": "SIP HEALTH"
+    },
+    "checkEquipment": "inventory",
+    "checkScore": "score",
+    "checkSkills": "skills",
+    "checkInventory": "inventory",
+    "autoPath": "WALK TO {destination}"
+  },
+  "resources": [
+    { "name": "hp", "max": "maxHp", "label": "Health" },
+    { "name": "mana", "max": "maxMana", "label": "Mana" },
+    { "name": "endurance", "max": "maxEndurance", "label": "Endurance" },
+    { "name": "willpower", "max": "maxWillpower", "label": "Willpower" }
+  ],
+  "capabilities": {
+    "hasAutoPath": true,
+    "hasTrains": false,
+    "hasPractices": false,
+    "hasLessons": true,
+    "hasBalance": true,
+    "hasEquilibrium": true,
+    "combatModel": "balance",
+    "equipmentOutputPattern": "You are holding:|You are wearing:"
+  },
+  "social": {
+    "patterns": {
+      "tell": "^(\\w+) tells you, \"(.+)\"$",
+      "say": "^(\\w+) says, \"(.+)\"$",
+      "party": "^\\(Party\\) (\\w+) says, \"(.+)\"$",
+      "enter": "^(\\w+) arrives from",
+      "emote": "^(\\w+) (nods|waves|grins|laughs)"
+    },
+    "channels": {
+      "tell": { "type": "direct", "obligation": "high" },
+      "say": { "type": "room", "obligation": "medium" },
+      "party": { "type": "group", "obligation": "medium" },
+      "enter": { "type": "system", "obligation": "none" },
+      "emote": { "type": "system", "obligation": "none" }
+    }
+  },
+  "defaults": {
+    "hp": 100,
+    "maxHp": 100,
+    "mana": 100,
+    "maxMana": 100,
+    "endurance": 100,
+    "maxEndurance": 100,
+    "willpower": 100,
+    "maxWillpower": 100
+  },
+  "fieldTTLs": {
+    "hp": 120000,
+    "maxHp": 120000,
+    "mana": 120000,
+    "maxMana": 120000,
+    "endurance": 120000,
+    "maxEndurance": 120000,
+    "willpower": 120000,
+    "maxWillpower": 120000,
+    "inCombat": 60000,
+    "currentRoom": 300000,
+    "gameState": 60000,
+    "recentEvents": 300000
+  }
+}

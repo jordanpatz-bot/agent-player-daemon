@@ -1,0 +1,79 @@
+{
+  "name": "mage-tactical",
+  "description": "Mage tactical behavior: mana awareness, spell healing, flee early",
+  "tree": {
+    "type": "selector",
+    "name": "root",
+    "children": [
+
+      {
+        "type": "guard",
+        "name": "emergency-flee",
+        "condition": { "type": "and", "conditions": [
+          { "type": "inCombat" },
+          { "type": "hpPercent", "op": "<=", "value": 0.20 }
+        ]},
+        "children": [
+          { "type": "action", "name": "flee", "command": "recall" }
+        ]
+      },
+
+      {
+        "type": "guard",
+        "name": "combat-heal-spell",
+        "condition": { "type": "and", "conditions": [
+          { "type": "inCombat" },
+          { "type": "hpPercent", "op": "<=", "value": 0.50 },
+          { "type": "manaPercent", "op": ">=", "value": 0.10 }
+        ]},
+        "children": [
+          { "type": "cooldown", "name": "spell-heal-cd", "ms": 5000,
+            "child": { "type": "action", "name": "cast-heal", "command": "cast 'cure light'" }
+          }
+        ]
+      },
+
+      {
+        "type": "guard",
+        "name": "combat-heal-potion",
+        "condition": { "type": "and", "conditions": [
+          { "type": "inCombat" },
+          { "type": "hpPercent", "op": "<=", "value": 0.40 }
+        ]},
+        "children": [
+          { "type": "cooldown", "name": "potion-heal-cd", "ms": 5000,
+            "child": { "type": "action", "name": "quaff", "command": "quaff heal" }
+          }
+        ]
+      },
+
+      {
+        "type": "guard",
+        "name": "low-mana-rest",
+        "condition": { "type": "and", "conditions": [
+          { "type": "notInCombat" },
+          { "type": "manaPercent", "op": "<=", "value": 0.20 }
+        ]},
+        "children": [
+          { "type": "cooldown", "name": "mana-rest-cd", "ms": 15000,
+            "child": { "type": "action", "name": "rest-mana", "command": "rest" }
+          }
+        ]
+      },
+
+      {
+        "type": "guard",
+        "name": "idle-recovery",
+        "condition": { "type": "and", "conditions": [
+          { "type": "notInCombat" },
+          { "type": "hpPercent", "op": "<=", "value": 0.50 }
+        ]},
+        "children": [
+          { "type": "cooldown", "name": "rest-cd", "ms": 15000,
+            "child": { "type": "action", "name": "rest-hp", "command": "rest" }
+          }
+        ]
+      }
+    ]
+  }
+}

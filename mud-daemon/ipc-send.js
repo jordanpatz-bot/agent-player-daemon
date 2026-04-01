@@ -6,6 +6,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { atomicWriteJSON } = require('./atomic-write');
 
 const profile = process.argv[2];
 const rawCmds = process.argv.slice(3);
@@ -36,10 +37,7 @@ const id = `cmd-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
 // Write command file (atomic: write tmp, rename)
 const cmdFile = path.join(commandsDir, `${id}.json`);
-const tmpFile = cmdFile + '.tmp';
-const payload = JSON.stringify({ id, commands }, null, 2);
-fs.writeFileSync(tmpFile, payload);
-fs.renameSync(tmpFile, cmdFile);
+atomicWriteJSON(cmdFile, { id, commands });
 console.log(`Sent ${commands.length} commands as ${id}`);
 
 // Poll for result
@@ -64,6 +62,14 @@ const poll = setInterval(() => {
         // Strip ANSI/telnet control chars for readability
         const clean = result.output.replace(/[\x00-\x09\x0b-\x1f]|\x1b\[[0-9;]*m/g, '').trim();
         console.log(clean);
+      }
+      if (result.audit && result.audit.findings && result.audit.findings.length > 0) {
+        console.log('\n--- Audit Findings ---');
+        for (const f of result.audit.findings) {
+          console.log(`[${f.severity}] ${f.id}: ${f.message}`);
+          if (f.data) console.log('  Data:', JSON.stringify(f.data));
+        }
+        console.log(`(${result.audit.suppressedCount} suppressed, ${result.audit.customRuleCount} custom rules)`);
       }
     } catch (e) {
       console.error('Failed to parse result:', e.message);

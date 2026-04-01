@@ -1,0 +1,66 @@
+{
+  "version": 2,
+  "description": "Aardwolf warrior default reflexes",
+  "rules": [
+    {
+      "id": "emergency-flee",
+      "priority": 1,
+      "enabled": true,
+      "conditions": [
+        { "type": "hpPercent", "op": "<=", "value": 0.20 },
+        { "type": "inCombat" }
+      ],
+      "action": {
+        "command": "recall",
+        "failPatterns": ["you failed", "can't recall"],
+        "fallback": "flee"
+      },
+      "cooldown": 5000,
+      "description": "Emergency flee at 20% HP. Falls back to flee if recall fails."
+    },
+    {
+      "id": "combat-heal",
+      "priority": 2,
+      "enabled": true,
+      "conditions": [
+        { "type": "hpPercent", "op": "<=", "value": 0.50 },
+        { "type": "inCombat" }
+      ],
+      "action": {
+        "command": "quaff heal",
+        "failPatterns": ["you don't have that", "you do not have that", "nothing to quaff"],
+        "fallback": "recall"
+      },
+      "cooldown": 5000,
+      "description": "Heal at 50% HP with potion. Falls back to recall if out of potions."
+    },
+    {
+      "id": "idle-heal-potion",
+      "priority": 3,
+      "enabled": true,
+      "conditions": [
+        { "type": "hpPercent", "op": "<=", "value": 0.60 },
+        { "type": "notInCombat" }
+      ],
+      "action": {
+        "command": "quaff heal",
+        "failPatterns": ["you don't have that", "you do not have that"],
+        "fallback": "rest"
+      },
+      "cooldown": 8000,
+      "description": "Heal with potion when idle and hurt. Falls back to rest."
+    },
+    {
+      "id": "idle-rest",
+      "priority": 5,
+      "enabled": true,
+      "conditions": [
+        { "type": "hpPercent", "op": "<=", "value": 0.40 },
+        { "type": "notInCombat" }
+      ],
+      "action": { "command": "rest" },
+      "cooldown": 30000,
+      "description": "Rest when HP low outside combat"
+    }
+  ]
+}

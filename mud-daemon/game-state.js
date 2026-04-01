@@ -16,8 +16,9 @@
 //   - Command mutex: reflexes queue behind active IPC commands
 //   - Typed commands are convenience, not gates: raw passthrough stays
 //
-// Ported state detection logic from Mico's combat-fsm.js (mob parsing,
-// HP thresholds, room scanning, flavor text filtering).
+// All server-specific patterns, thresholds, and commands are read from a
+// ServerProfile instance. If no profile is supplied the engine still works
+// with safe (no-op) defaults and logs a warning.
 
 const EventEmitter = require('events');
 
@@ -29,84 +30,6 @@ const GAME_STATES = {
   resting: 'resting',
 };
 
-// --- Mob Detection (ported from Mico's combat-fsm.js) ---
-
-// Lines matching these patterns are room events/flavor, NOT targetable mobs
-const FLAVOR_FILTERS = [
-  /startled by/i,
-  /scampers? (?:off|away)/i,
-  /runs? away/i,
-  /disappears?/i,
-  /leaves? (?:heading |going )?(?:north|south|east|west|up|down)/i,
-  /arrives? from/i,
-  /your presence/i,
-  /flies? (?:off|away)/i,
-  /darts? (?:off|away|into)/i,
-  /burrows? into/i,
-  /slips? (?:away|into)/i,
-  /has arrived/i,
-  /just left/i,
-  /^\(Player\)/i,
-  /^\(Charmed\)/i,
-  /^\(Animated\)/i,
-];
-
-// Scenery "mobs" that appear in descriptions but aren't targetable
-const SCENERY_MOBS = ['grasshopper'];
-
-// Standing verbs that indicate a targetable mob in the room
-const STANDING_VERBS = /waddles|slithers|glides|lurks|prowls|stands|sits|crawls|hops|coils|rests|waits|watches|guards|circles|paces|flutters|flexes|threatens|wanders|roams|floats|hovers|shambles|staggers|gnaws|snarls|growls|looms|shuffles|flies|scurries|twitches|lopes/i;
-
-// --- Combat Detection Patterns ---
-const COMBAT_PATTERNS = {
-  MOB_DIED: /(.+?) is (?:slain|DEAD)/i,
-  MOB_HIT_YOU: /(.+?) (?:hits|misses|scratches|decimates|mauls|claws|bites|stings|whips|slashes|pierces|pounds|crushes|blasts) you/i,
-  YOU_HIT_MOB: /Your (.+?) (?:hits|misses|scratches|decimates|mauls|claws|bites|stings|whips|slashes|pierces|pounds|crushes|blasts)/i,
-  FLEE_SUCCESS: /You flee from combat|You recall/i,
-  NOT_IN_COMBAT: /You aren't fighting anyone|Not while you are fighting/i,
-  MOB_FLED: /turns tail and runs|flees from combat/i,
-};
-
-// --- Reflex Thresholds ---
-const REFLEX_HEAL_PCT = 0.50;   // Auto-heal at 50% HP
-const REFLEX_FLEE_PCT = 0.20;   // Auto-flee at 20% HP
-
-// --- Typed Command Translators (Aardwolf) ---
-// Each translator returns a raw MUD command string, or null if invalid.
-const TYPED_COMMANDS = {
-  move: (params) => {
-    const dir = params && params.direction;
-    const VALID_DIRS = ['north', 'south', 'east', 'west', 'up', 'down',
-      'n', 's', 'e', 'w', 'u', 'd',
-      'northeast', 'northwest', 'southeast', 'southwest',
-      'ne', 'nw', 'se', 'sw'];
-    if (!dir || !VALID_DIRS.includes(dir.toLowerCase())) {
-      return { error: `Invalid direction: "${dir}". Valid: ${VALID_DIRS.join(', ')}` };
-    }
-    return { command: dir.toLowerCase() };
-  },
-
-  attack: (params) => {
-    const target = params && params.target;
-    if (!target || typeof target !== 'string') {
-      return { error: 'Attack requires a target string' };
-    }
-    // Sanitize: no semicolons, no command injection
-    const clean = target.replace(/[;\n\r]/g, '').trim().substring(0, 50);
-    if (!clean) return { error: 'Empty target after sanitization' };
-    return { command: `kill ${clean}` };
-  },
-
-  look: (params) => {
-    const target = params && params.target;
-    if (target) {
-      const clean = target.replace(/[;\n\r]/g, '').trim().substring(0, 50);
-      return { command: `look ${clean}` };
-    }
-    return { command: 'look' };
-  },
-};
-
 
 class GameStateEngine extends EventEmitter {
   constructor(options = {}) {
@@ -114,6 +37,14 @@ class GameStateEngine extends EventEmitter {
     this.blackboard = options.blackboard;   // BlackboardStore instance
     this.connection = options.connection;     // MudConnection instance (for sending commands)
     this.log = options.log || ((type, msg) => console.log(`[GameState:${type}] ${msg}`));
+
+    // Server profile — all patterns, thresholds, and command templates
+    this.serverProfile = options.serverProfile || null;
+    this._characterClass = options.characterClass || 'unknown';
+
+    if (!this.serverProfile) {
+      this.log('WARN', 'No serverProfile supplied — combat detection, reflexes, and mob parsing will be inert');
+    }
 
     // Current game state
     this._state = GAME_STATES.idle;
@@ -130,15 +61,29 @@ class GameStateEngine extends EventEmitter {
     // Command mutex: true when IPC is executing commands
     this._ipcBusy = false;
 
+    // --- Thresholds & cooldowns (from profile, with defaults) ---
+    const combat = (this.serverProfile && this.serverProfile.combatCooldowns) || {};
+    this._healThreshold = 0.50;
+    this._fleeThreshold = 0.20;
+    if (this.serverProfile) {
+      // Allow the profile to override thresholds via its combat config
+      const raw = this.serverProfile._raw && this.serverProfile._raw.combat;
+      if (raw) {
+        if (typeof raw.healThreshold === 'number') this._healThreshold = raw.healThreshold;
+        if (typeof raw.fleeThreshold === 'number') this._fleeThreshold = raw.fleeThreshold;
+      }
+    }
+
+    this._healCooldownMs = combat.healMs || 5000;
+    this._fleeCooldownMs = combat.fleeMs || 10000;
+    this._combatIdleMs = (this.serverProfile && this.serverProfile.combatIdleTimeoutMs) || 15000;
+
     // Idle timer: if no combat output for N seconds while in combat, drop to idle
     this._combatIdleTimer = null;
-    this._combatIdleMs = 15000; // 15s of silence = not in combat
 
     // Reflex cooldowns (prevent spam)
     this._lastHealAt = 0;
     this._lastFleeAt = 0;
-    this._healCooldownMs = 5000;   // Don't re-heal within 5s
-    this._fleeCooldownMs = 10000;  // Don't re-flee within 10s
 
     // Write initial state to blackboard
     this._syncBlackboard();
@@ -164,16 +109,52 @@ class GameStateEngine extends EventEmitter {
       return { error: 'Typed command must be an object with an "action" field' };
     }
 
-    const translator = TYPED_COMMANDS[typed.action];
-    if (!translator) {
-      // Unknown action — check if it has a raw field for passthrough
-      if (typed.raw && typeof typed.raw === 'string') {
-        return { command: typed.raw.replace(/[;\n\r]/g, '').trim() };
+    const action = typed.action;
+
+    // --- move ---
+    if (action === 'move') {
+      const dir = typed.direction;
+      const validDirs = this.serverProfile
+        ? this.serverProfile.getMoveDirections()
+        : ['north', 'south', 'east', 'west', 'up', 'down',
+           'n', 's', 'e', 'w', 'u', 'd'];
+      if (!dir || !validDirs.includes(dir.toLowerCase())) {
+        return { error: `Invalid direction: "${dir}". Valid: ${validDirs.join(', ')}` };
       }
-      return { error: `Unknown action: "${typed.action}". Valid: ${Object.keys(TYPED_COMMANDS).join(', ')}. Use "raw" field for passthrough.` };
+      return { command: dir.toLowerCase() };
     }
 
-    return translator(typed);
+    // --- attack ---
+    if (action === 'attack') {
+      const target = typed.target;
+      if (!target || typeof target !== 'string') {
+        return { error: 'Attack requires a target string' };
+      }
+      const clean = target.replace(/[;\n\r]/g, '').trim().substring(0, 50);
+      if (!clean) return { error: 'Empty target after sanitization' };
+      const cmd = this.serverProfile
+        ? this.serverProfile.getCommand('attack', { target: clean })
+        : `kill ${clean}`;
+      return { command: cmd || `kill ${clean}` };
+    }
+
+    // --- look ---
+    if (action === 'look') {
+      const params = {};
+      if (typed.target) {
+        params.target = typed.target.replace(/[;\n\r]/g, '').trim().substring(0, 50);
+      }
+      const cmd = this.serverProfile
+        ? this.serverProfile.getCommand('look', params)
+        : (params.target ? `look ${params.target}` : 'look');
+      return { command: cmd || (params.target ? `look ${params.target}` : 'look') };
+    }
+
+    // --- Unknown action — check raw passthrough ---
+    if (typed.raw && typeof typed.raw === 'string') {
+      return { command: typed.raw.replace(/[;\n\r]/g, '').trim() };
+    }
+    return { error: `Unknown action: "${action}". Valid: move, attack, look. Use "raw" field for passthrough.` };
   }
 
   // Get a snapshot for IPC results
@@ -198,33 +179,45 @@ class GameStateEngine extends EventEmitter {
 
   // Process incoming MUD text for state detection and reflexes
   processText(text) {
+    const cp = this.serverProfile && this.serverProfile.combatPatterns;
+    if (!cp) return; // No profile — skip combat detection entirely
+
     // Combat detection
-    if (COMBAT_PATTERNS.MOB_HIT_YOU.test(text) || COMBAT_PATTERNS.YOU_HIT_MOB.test(text)) {
+    const mobHitYou = cp.mobHitYou;
+    const youHitMob = cp.youHitMob;
+    if ((mobHitYou && mobHitYou.test(text)) || (youHitMob && youHitMob.test(text))) {
       this._enterCombat(text);
       this._resetCombatIdleTimer();
     }
 
     // Mob death
-    const deathMatch = text.match(COMBAT_PATTERNS.MOB_DIED);
-    if (deathMatch) {
-      this._recordEvent('kill', `${deathMatch[1]} slain`);
-      this._exitCombat('mob died');
+    const mobDied = cp.mobDied;
+    if (mobDied) {
+      const deathMatch = text.match(mobDied);
+      if (deathMatch) {
+        const mobName = deathMatch[1] || deathMatch[2] || 'Unknown';
+        this._recordEvent('kill', `${mobName} slain`);
+        this._exitCombat('mob died');
+      }
     }
 
     // Mob fled
-    if (COMBAT_PATTERNS.MOB_FLED.test(text)) {
+    const mobFled = cp.mobFled;
+    if (mobFled && mobFled.test(text)) {
       this._recordEvent('mob_fled', 'Target fled combat');
       this._exitCombat('mob fled');
     }
 
     // Successful flee/recall
-    if (COMBAT_PATTERNS.FLEE_SUCCESS.test(text)) {
+    const fleeSuccess = cp.fleeSuccess;
+    if (fleeSuccess && fleeSuccess.test(text)) {
       this._recordEvent('fled', 'Escaped combat');
       this._transition(GAME_STATES.resting, 'fled combat');
     }
 
     // Room detection — if we see exits, we might be exploring
-    if (/\[ Exits:/.test(text) && this._state === GAME_STATES.idle) {
+    const exitPattern = this.serverProfile.exitPattern;
+    if (exitPattern && exitPattern.test(text) && this._state === GAME_STATES.idle) {
       // Only transition to exploring if we recently moved (not just looking around)
       // For now, don't auto-transition — let the agent or typed commands drive this
     }
@@ -232,7 +225,7 @@ class GameStateEngine extends EventEmitter {
 
   // Process HP updates (from GMCP or prompt parsing)
   processVitals(hp, maxHp, mana, maxMana) {
-    if (!hp || !maxHp) return;
+    if (hp == null || maxHp == null || maxHp === 0) return;
 
     const hpPct = hp / maxHp;
 
@@ -240,22 +233,27 @@ class GameStateEngine extends EventEmitter {
     if (this._state === GAME_STATES.combat && !this._ipcBusy) {
       const now = Date.now();
 
-      // Auto-flee at 20% HP (highest priority)
-      if (hpPct <= REFLEX_FLEE_PCT && (now - this._lastFleeAt > this._fleeCooldownMs)) {
+      // Auto-flee at threshold (highest priority)
+      if (hpPct <= this._fleeThreshold && (now - this._lastFleeAt > this._fleeCooldownMs)) {
         this._lastFleeAt = now;
         this._recordEvent('reflex_flee', `HP critical: ${hp}/${maxHp} (${(hpPct * 100).toFixed(0)}%)`);
         this.log('REFLEX', `Auto-flee triggered: ${hp}/${maxHp} (${(hpPct * 100).toFixed(0)}%)`);
-        this.emit('reflex', 'recall');
+        const fleeCmd = this.serverProfile
+          ? this.serverProfile.getFleeCommand()
+          : 'recall';
+        this.emit('reflex', fleeCmd);
         return; // Don't also heal
       }
 
-      // Auto-heal at 50% HP
-      if (hpPct <= REFLEX_HEAL_PCT && (now - this._lastHealAt > this._healCooldownMs)) {
+      // Auto-heal at threshold
+      if (hpPct <= this._healThreshold && (now - this._lastHealAt > this._healCooldownMs)) {
         this._lastHealAt = now;
         this._recordEvent('reflex_heal', `HP low: ${hp}/${maxHp} (${(hpPct * 100).toFixed(0)}%)`);
         this.log('REFLEX', `Auto-heal triggered: ${hp}/${maxHp} (${(hpPct * 100).toFixed(0)}%)`);
-        // Use 'cast cure light' for Aardwolf — profile-configurable in future
-        this.emit('reflex', 'cast \'cure light\'');
+        const healCmd = this.serverProfile
+          ? this.serverProfile.getHealCommand(this._characterClass)
+          : 'quaff heal';
+        this.emit('reflex', healCmd);
       }
     }
 
@@ -275,30 +273,43 @@ class GameStateEngine extends EventEmitter {
     const lines = roomText.split('\n');
     let pastExits = false;
 
+    const exitPattern = this.serverProfile && this.serverProfile.exitPattern;
+    const promptLine = this.serverProfile && this.serverProfile.promptLine;
+    const flavorFilters = (this.serverProfile && this.serverProfile.flavorFilters) || [];
+    const sceneryMobs = (this.serverProfile && this.serverProfile.sceneryMobs) || [];
+    const standingVerbs = this.serverProfile && this.serverProfile.standingVerbs;
+
     for (const line of lines) {
       const trimmed = line.trim();
 
-      if (/\[ Exits:/.test(trimmed)) {
+      if (exitPattern && exitPattern.test(trimmed)) {
         pastExits = true;
         continue;
       }
 
       if (!pastExits) continue;
-      if (!trimmed || /^\[.*hp.*mn.*mv/.test(trimmed) || /^>/.test(trimmed)) continue;
+      if (!trimmed) continue;
+      // Skip prompt lines
+      if (promptLine && promptLine.test(trimmed)) continue;
+      if (/^>/.test(trimmed)) continue;
       if (trimmed.length > 100) continue;
 
-      const isFlavor = FLAVOR_FILTERS.some(re => re.test(trimmed));
+      const isFlavor = flavorFilters.some(re => re.test(trimmed));
       if (isFlavor) continue;
 
       const lower = trimmed.toLowerCase();
-      if (SCENERY_MOBS.some(s => lower.includes(s))) continue;
+      if (sceneryMobs.some(s => lower.includes(s))) continue;
 
       let mobName = null;
 
       // Pattern 1: "A/An/The <mob> <standing-verb>"
       const stripped = trimmed.replace(/^\([^)]+\)\s*/, '');
-      if (/^(A|An|The) /i.test(stripped) && STANDING_VERBS.test(stripped)) {
-        const nameMatch = stripped.match(/^(?:A|An|The)\s+(.+?)(?:\s+(?:waddles|slithers|glides|lurks|prowls|stands|sits|crawls|hops|coils|rests|waits|watches|guards|circles|paces|flutters|flexes|threatens|wanders|roams|floats|hovers|shambles|staggers|gnaws|snarls|growls|looms|shuffles|is |with ))/i);
+      if (/^(A|An|The) /i.test(stripped) && standingVerbs && standingVerbs.test(stripped)) {
+        // Use the standingVerbs regex itself to find the break point
+        const nameMatch = stripped.match(new RegExp(
+          '^(?:A|An|The)\\s+(.+?)(?:\\s+(?:' + standingVerbs.source + '|is |with ))',
+          'i'
+        ));
         if (nameMatch) mobName = nameMatch[1].toLowerCase();
       }
 
@@ -351,8 +362,8 @@ class GameStateEngine extends EventEmitter {
     if (this._state === GAME_STATES.combat) {
       this._combatIdleTimer = setTimeout(() => {
         if (this._state === GAME_STATES.combat) {
-          this.log('STATE', 'Combat idle timeout — returning to idle');
-          this._exitCombat('combat timeout (no output for 15s)');
+          this.log('STATE', `Combat idle timeout — returning to idle`);
+          this._exitCombat(`combat timeout (no output for ${this._combatIdleMs / 1000}s)`);
         }
       }, this._combatIdleMs);
     }
@@ -398,11 +409,4 @@ class GameStateEngine extends EventEmitter {
 module.exports = {
   GameStateEngine,
   GAME_STATES,
-  TYPED_COMMANDS,
-  COMBAT_PATTERNS,
-  FLAVOR_FILTERS,
-  SCENERY_MOBS,
-  STANDING_VERBS,
-  REFLEX_HEAL_PCT,
-  REFLEX_FLEE_PCT,
 };

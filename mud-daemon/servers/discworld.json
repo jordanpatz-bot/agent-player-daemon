@@ -1,0 +1,128 @@
+{
+  "id": "discworld",
+  "name": "Discworld MUD",
+  "connection": {
+    "host": "discworld.starturtle.net",
+    "port": 4242,
+    "loginDetect": "your choice",
+    "passwordDetect": "password",
+    "inGameDetect": "obvious exits|inventory regeneration|> ",
+    "enterPrompts": "\\[press enter|press return|hit return|--more--",
+    "promptPattern": null,
+    "promptFields": [],
+    "quitCommands": ["quit"],
+    "debounceMs": 1500,
+    "extraLogin": [
+      { "detect": "throw the other copy out|already playing", "send": "y" },
+      { "detect": "nationality|morporkian.*choose", "send": "morporkian" }
+    ],
+    "keepalive": {
+      "command": "date",
+      "intervalMs": 600000
+    }
+  },
+  "gmcp": {
+    "packages": [
+      "char 1", "char.vitals 1", "char.status 1",
+      "room 1", "room.info 1",
+      "comm 1"
+    ],
+    "vitalsMap": {
+      "hp": "hp", "maxhp": "maxHp",
+      "gp": "mana", "maxgp": "maxMana",
+      "xp": "xp", "burden": "burden",
+      "alignment": "alignment"
+    },
+    "channelFormat": "auto",
+    "stateMap": {}
+  },
+  "combat": {
+    "patterns": {
+      "mobDied": "(.+?) dies",
+      "mobHitYou": "(.+?) (?:hits|attacks|scratches|claws|bites) you",
+      "youHitMob": "You (?:hit|attack|scratch|claw|bite)",
+      "fleeSuccess": "You run away",
+      "notInCombat": "You are not fighting",
+      "mobFled": "runs away|flees"
+    },
+    "idleTimeoutMs": 20000,
+    "cooldowns": {
+      "healMs": 5000,
+      "fleeMs": 10000
+    }
+  },
+  "parsing": {
+    "exitPattern": "obvious exits|There (?:is|are) \\d+ obvious exits?",
+    "flavorFilters": [
+      "arrives from",
+      "leaves? (?:heading )?(?:north|south|east|west)",
+      "has arrived",
+      "just left"
+    ],
+    "sceneryMobs": [],
+    "standingVerbs": "stands|sits|lurks|prowls|guards|watches|wanders|floats",
+    "playerMarker": null,
+    "promptLine": null
+  },
+  "commands": {
+    "move": {
+      "validDirections": [
+        "north", "south", "east", "west", "up", "down",
+        "n", "s", "e", "w", "u", "d",
+        "northeast", "northwest", "southeast", "southwest",
+        "ne", "nw", "se", "sw"
+      ],
+      "template": "{direction}"
+    },
+    "attack": { "template": "kill {target}" },
+    "look": { "template": "look", "targetTemplate": "look at {target}" },
+    "flee": { "template": "run away" },
+    "groupSay": { "template": "say {message}" },
+    "heal": {
+      "default": "cast cure on me"
+    }
+  },
+  "social": {
+    "patterns": {
+      "tell": "^(\\w+) tells you: (.+)$",
+      "say": "^(\\w+) says: (.+)$",
+      "enter": "^(\\w+) arrives",
+      "emote": "^(\\w+) (nods|waves|grins|laughs|smiles)"
+    },
+    "channels": {
+      "tell": { "type": "direct", "obligation": "high" },
+      "say": { "type": "room", "obligation": "medium" },
+      "enter": { "type": "system", "obligation": "none" },
+      "emote": { "type": "system", "obligation": "none" }
+    }
+  },
+  "resources": [
+    { "name": "hp", "max": "maxHp", "label": "Health" },
+    { "name": "mana", "max": "maxMana", "label": "Guild Points" }
+  ],
+  "capabilities": {
+    "hasAutoPath": false,
+    "hasTrains": false,
+    "hasPractices": false,
+    "hasLessons": false,
+    "hasGMCP": false,
+    "combatModel": "round",
+    "equipmentOutputPattern": "You are wearing:|wielding:"
+  },
+  "defaults": {
+    "hp": 100,
+    "maxHp": 100,
+    "mana": 100,
+    "maxMana": 100
+  },
+  "fieldTTLs": {
+    "hp": 120000,
+    "maxHp": 120000,
+    "mana": 120000,
+    "maxMana": 120000,
+    "inCombat": 60000,
+    "currentRoom": 300000,
+    "gameState": 60000,
+    "recentEvents": 300000
+  }
+}

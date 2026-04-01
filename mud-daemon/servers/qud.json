@@ -1,0 +1,83 @@
+{
+  "id": "qud",
+  "name": "Caves of Qud",
+  "connectionType": "file-ipc",
+  "connection": {
+    "stateFile": "state.json",
+    "commandFile": "command.txt",
+    "resultFile": "result.json",
+    "pollIntervalMs": 500
+  },
+  "gmcp": {
+    "packages": [],
+    "vitalsMap": {},
+    "channelFormat": "none",
+    "stateMap": {}
+  },
+  "combat": {
+    "patterns": {},
+    "idleTimeoutMs": 10000,
+    "cooldowns": { "healMs": 3000, "fleeMs": 5000 }
+  },
+  "parsing": {
+    "exitPattern": null,
+    "flavorFilters": [],
+    "sceneryMobs": [],
+    "standingVerbs": null,
+    "playerMarker": null,
+    "promptLine": null
+  },
+  "commands": {
+    "navigate": { "template": "navigate {target}" },
+    "talkto": { "template": "talkto {target}" },
+    "choose": { "template": "choose {index}" },
+    "attack": { "template": "attack {direction}" },
+    "move": { "template": "move {direction}" },
+    "eat": { "template": "eat" },
+    "drink": { "template": "drink" },
+    "equip": { "template": "equip {item}" },
+    "examine": { "template": "examine {target}" },
+    "trade": { "template": "trade {target}" },
+    "activate": { "template": "activate {ability}" },
+    "useitem": { "template": "useitem {item}" },
+    "status": { "template": "status" },
+    "rest": { "template": "rest" },
+    "save": { "template": "save" },
+    "look": { "template": "look" },
+    "flee": { "template": "move s" },
+    "heal": { "default": "eat" },
+    "checkEquipment": "inventory",
+    "checkScore": "character"
+  },
+  "resources": [
+    { "name": "hp", "max": "maxHp", "label": "Health" }
+  ],
+  "capabilities": {
+    "hasAutoPath": true,
+    "hasNavigation": true,
+    "hasConversation": true,
+    "hasCombat": true,
+    "hasGMCP": false,
+    "hasTrains": false,
+    "hasPractices": false,
+    "hasLessons": false,
+    "combatModel": "turnBased",
+    "connectionType": "file-ipc"
+  },
+  "social": {
+    "patterns": {},
+    "channels": {}
+  },
+  "defaults": {
+    "hp": 18,
+    "maxHp": 18
+  },
+  "fieldTTLs": {
+    "hp": 60000,
+    "maxHp": 60000,
+    "inCombat": 30000,
+    "currentRoom": 60000,
+    "gameState": 30000,
+    "recentEvents": 300000
+  }
+}

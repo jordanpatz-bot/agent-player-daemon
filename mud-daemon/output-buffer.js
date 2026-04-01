@@ -3,6 +3,7 @@
 // Keeps the last N characters, writes periodic snapshots to disk.
 
 const fs = require('fs');
+const { atomicWrite } = require('./atomic-write');
 const path = require('path');
 
 class OutputBuffer {
@@ -81,13 +82,8 @@ class OutputBuffer {
   }
 
   _writeSnapshot() {
-    try {
-      const tmp = this.filePath + '.tmp';
-      fs.writeFileSync(tmp, this.buffer);
-      fs.renameSync(tmp, this.filePath);
-    } catch {
-      // Non-fatal
-    }
+    try { atomicWrite(this.filePath, this.buffer); }
+    catch { /* Non-fatal */ }
   }
 }
 

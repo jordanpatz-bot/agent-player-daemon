@@ -1,0 +1,7 @@
+node_modules/
+.env
+*.log
+qud-journal.json
+mud-daemon/data/
+mud-daemon/profiles.json
+mud-daemon/*.lock

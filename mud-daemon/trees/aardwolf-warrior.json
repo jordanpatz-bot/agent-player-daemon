@@ -1,0 +1,50 @@
+{
+  "name": "warrior-tactical",
+  "description": "Warrior tactical behavior: survive first, then fight effectively",
+  "tree": {
+    "type": "selector",
+    "name": "root",
+    "children": [
+
+      {
+        "type": "guard",
+        "name": "emergency-flee",
+        "condition": { "type": "and", "conditions": [
+          { "type": "inCombat" },
+          { "type": "hpPercent", "op": "<=", "value": 0.15 }
+        ]},
+        "children": [
+          { "type": "action", "name": "flee", "command": "recall" }
+        ]
+      },
+
+      {
+        "type": "guard",
+        "name": "combat-heal",
+        "condition": { "type": "and", "conditions": [
+          { "type": "inCombat" },
+          { "type": "hpPercent", "op": "<=", "value": 0.50 }
+        ]},
+        "children": [
+          { "type": "cooldown", "name": "heal-cd", "ms": 5000,
+            "child": { "type": "action", "name": "heal", "command": "quaff heal" }
+          }
+        ]
+      },
+
+      {
+        "type": "guard",
+        "name": "idle-recovery",
+        "condition": { "type": "and", "conditions": [
+          { "type": "notInCombat" },
+          { "type": "hpPercent", "op": "<=", "value": 0.50 }
+        ]},
+        "children": [
+          { "type": "cooldown", "name": "rest-cd", "ms": 15000,
+            "child": { "type": "action", "name": "rest", "command": "rest" }
+          }
+        ]
+      }
+    ]
+  }
+}
