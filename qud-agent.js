@@ -584,7 +584,14 @@ QUESTS: ${quests || 'none tracked by game'}
 ${interactionStr}
 HOSTILE ENTITIES: ${hostileStr}
 ADJACENT: ${adj || 'nobody adjacent'}
-NEARBY NPCS: ${friendlyStr || 'none'}${eventsStr ? '\n' + eventsStr : ''}`;
+NEARBY NPCS: ${friendlyStr || 'none'}${eventsStr ? '\n' + eventsStr : ''}${summarizeKnownLocations(state)}`;
+}
+
+function summarizeKnownLocations(state) {
+  const locs = state.knownLocations || [];
+  if (locs.length === 0) return '';
+  const locStrs = locs.slice(0, 15).map(l => `${l.name} [${l.zoneId}]`).join('; ');
+  return `\nKNOWN LOCATIONS: ${locStrs}`;
 }
 
 // --- LLM prompt ---
@@ -603,6 +610,8 @@ COMMANDS:
 - equip <item> — equip from inventory
 - pickup <item> — grab from ground
 - activate <ability> — use mutation/ability
+- worldnav <location> — look up a known world location from journal. Returns zone ID and direction/distance. Use "worldnav list" to see all known locations. Then use move commands to travel in that direction across zone boundaries.
+- worldnav is for PLANNING — it tells you where to go, then you move there manually via zone transitions.
 - status — full character dump
 - rest — heal to full (safe areas)
 - save — save game

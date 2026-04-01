@@ -672,6 +672,25 @@ public class AgentBridgePart : IPart
         }
         state["quests"] = quests;
 
+        // Known world locations from journal
+        var knownLocations = new List<Dictionary<string, string>>();
+        try {
+            var journalType = typeof(XRL.Core.XRLCore).Assembly.GetType("Qud.API.JournalAPI");
+            var mapNotesField = journalType?.GetField("MapNotes", BindingFlags.Public | BindingFlags.Static);
+            var mapNotes = mapNotesField?.GetValue(null) as System.Collections.IList;
+            if (mapNotes != null) {
+                foreach (var note in mapNotes) {
+                    string text = note.GetType().GetProperty("Text")?.GetValue(note)?.ToString() ?? "";
+                    string zoneId = note.GetType().GetProperty("ZoneID")?.GetValue(note)?.ToString() ?? "";
+                    bool revealed = (bool)(note.GetType().GetProperty("Revealed")?.GetValue(note) ?? false);
+                    if (revealed && !string.IsNullOrEmpty(zoneId)) {
+                        knownLocations.Add(new Dictionary<string, string> { ["name"] = text, ["zoneId"] = zoneId });
+                    }
+                }
+            }
+        } catch { }
+        state["knownLocations"] = knownLocations;
+
         // Recent messages — try to get from the game's message buffer
         var messages = new List<string>();
         try
@@ -1196,6 +1215,10 @@ public class AgentBridgePart : IPart
         }
         else if (action == "talkto")
         {
+            // Clear any stale conversation state before starting a new one
+            _currentConvXml = null;
+            _currentNodeId = null;
+
             // Navigate to NPC + initiate conversation, all in one command
             var target = FindEntity(player, args.Trim());
             if (target?.CurrentCell != null)
@@ -1608,6 +1631,13 @@ public class AgentBridgePart : IPart
                                     var nextChoices = ReadChoicesFromNode(nextNodeEl);
                                     result["choices"] = nextChoices;
 
+                                    // If no choices remain, conversation is over — clear state
+                                    if (nextChoices.Count == 0)
+                                    {
+                                        _currentConvXml = null;
+                                        _currentNodeId = null;
+                                    }
+
                                     // Process QuestHandler parts on the TARGET NODE
                                     try
                                     {
@@ -1623,16 +1653,17 @@ public class AgentBridgePart : IPart
                                     result["npcText"] = "(Dialog node '" + targetId + "' is game-controlled)";
                                     result["choices"] = new List<Dictionary<string, string>>();
                                     _currentConvXml = null;
+                                    _currentNodeId = null;
                                 }
                             }
-                            else { result["message"] = "Conversation ended"; _currentConvXml = null; }
+                            else { result["message"] = "Conversation ended"; _currentConvXml = null; _currentNodeId = null; }
 
                             if (questActions.Count > 0)
                                 result["questActions"] = questActions;
                         }
                         else { result["status"] = "error"; result["message"] = $"Invalid choice {choiceIdx} (have {choiceNodes.Count} choices)"; }
                     }
-                    else { result["status"] = "error"; result["message"] = "Current node '" + _currentNodeId + "' not found"; _currentConvXml = null; }
+                    else { result["status"] = "error"; result["message"] = "Current node '" + _currentNodeId + "' not found"; _currentConvXml = null; _currentNodeId = null; }
                 }
                 catch (Exception ex) { result["status"] = "error"; result["message"] = "Choose error: " + ex.Message; }
             }
@@ -1935,6 +1966,132 @@ public class AgentBridgePart : IPart
             }
             result["skills"] = skillNames;
         }
+        else if (action == "worldnav" || action == "goto")
+        {
+            // Navigate to a named world location via the journal's map notes
+            string locationName = args.Trim();
+            result["status"] = "error";
+
+            try {
+                // Access JournalAPI.MapNotes via reflection (safe for version compatibility)
+                var journalType = typeof(XRL.Core.XRLCore).Assembly.GetType("Qud.API.JournalAPI");
+                if (journalType != null)
+                {
+                    // Get the MapNotes list
+                    var mapNotesField = journalType.GetField("MapNotes", BindingFlags.Public | BindingFlags.Static);
+                    var mapNotes = mapNotesField?.GetValue(null) as System.Collections.IList;
+
+                    if (mapNotes != null)
+                    {
+                        // List all known locations if no name given
+                        if (string.IsNullOrEmpty(locationName) || locationName == "list")
+                        {
+                            var locations = new List<Dictionary<string, string>>();
+                            foreach (var note in mapNotes)
+                            {
+                                // Get properties via reflection
+                                string text = note.GetType().GetProperty("Text")?.GetValue(note)?.ToString() ?? "";
+                                string zoneId = note.GetType().GetProperty("ZoneID")?.GetValue(note)?.ToString() ?? "";
+                                bool revealed = (bool)(note.GetType().GetProperty("Revealed")?.GetValue(note) ?? false);
+                                string category = note.GetType().GetProperty("Category")?.GetValue(note)?.ToString() ?? "";
+
+                                if (revealed && !string.IsNullOrEmpty(zoneId))
+                                {
+                                    locations.Add(new Dictionary<string, string> {
+                                        ["name"] = text,
+                                        ["zoneId"] = zoneId,
+                                        ["category"] = category
+                                    });
+                                }
+                            }
+                            result["status"] = "ok";
+                            result["locations"] = locations;
+                            result["message"] = locations.Count + " known locations";
+                        }
+                        else
+                        {
+                            // Find matching location by name
+                            string bestZoneId = null;
+                            string bestName = null;
+
+                            foreach (var note in mapNotes)
+                            {
+                                string text = note.GetType().GetProperty("Text")?.GetValue(note)?.ToString() ?? "";
+                                string zoneId = note.GetType().GetProperty("ZoneID")?.GetValue(note)?.ToString() ?? "";
+                                bool revealed = (bool)(note.GetType().GetProperty("Revealed")?.GetValue(note) ?? false);
+
+                                if (revealed && !string.IsNullOrEmpty(zoneId) &&
+                                    text.IndexOf(locationName, StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    bestZoneId = zoneId;
+                                    bestName = text;
+                                    break;
+                                }
+                            }
+
+                            if (bestZoneId != null)
+                            {
+                                result["status"] = "ok";
+                                result["location"] = bestName;
+                                result["targetZoneId"] = bestZoneId;
+
+                                // Parse zone ID to get world coordinates
+                                // Format: "JoppaWorld.X.Y.localX.localY.Z"
+                                var zoneParts = bestZoneId.Split('.');
+                                if (zoneParts.Length >= 3)
+                                {
+                                    int worldX, worldY;
+                                    if (int.TryParse(zoneParts[1], out worldX) && int.TryParse(zoneParts[2], out worldY))
+                                    {
+                                        // Get current world position
+                                        var currentZone = player.CurrentCell?.ParentZone?.ZoneID ?? "";
+                                        var currentParts = currentZone.Split('.');
+                                        int curWorldX = 0, curWorldY = 0;
+                                        if (currentParts.Length >= 3)
+                                        {
+                                            int.TryParse(currentParts[1], out curWorldX);
+                                            int.TryParse(currentParts[2], out curWorldY);
+                                        }
+
+                                        result["worldTarget"] = new Dictionary<string, int> { ["x"] = worldX, ["y"] = worldY };
+                                        result["worldCurrent"] = new Dictionary<string, int> { ["x"] = curWorldX, ["y"] = curWorldY };
+
+                                        // Calculate direction
+                                        int dx = worldX - curWorldX;
+                                        int dy = worldY - curWorldY;
+                                        string direction = "";
+                                        if (dy < 0) direction += "north";
+                                        if (dy > 0) direction += "south";
+                                        if (dx > 0) direction += "east";
+                                        if (dx < 0) direction += "west";
+                                        result["direction"] = direction;
+                                        result["worldDistance"] = Math.Abs(dx) + Math.Abs(dy);
+                                        result["message"] = $"{bestName} is {Math.Abs(dx) + Math.Abs(dy)} world tiles {direction} (world {worldX},{worldY} from {curWorldX},{curWorldY})";
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                result["message"] = "Location not found in journal: " + locationName;
+
+                                // List available locations as hint
+                                var available = new List<string>();
+                                foreach (var note in mapNotes)
+                                {
+                                    string text = note.GetType().GetProperty("Text")?.GetValue(note)?.ToString() ?? "";
+                                    bool revealed = (bool)(note.GetType().GetProperty("Revealed")?.GetValue(note) ?? false);
+                                    if (revealed) available.Add(text);
+                                }
+                                if (available.Count > 0) result["available"] = available;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) {
+                result["message"] = "Journal access error: " + ex.Message;
+            }
+        }
         else
         {
             // Map all other commands to Qud's internal command IDs
@@ -1980,7 +2137,7 @@ public class AgentBridgePart : IPart
             {
                 result["status"] = "unknown";
                 result["message"] = "Unknown command: " + fullCmd;
-                result["hint"] = "Available: move, wait, rest, look, talk, get, use, open, fire, throw, interact, attack <dir>, autoexplore, autoattack, inventory, equipment, character, skills, abilities, quests, journal, save";
+                result["hint"] = "Available: move, wait, rest, look, talk, get, use, open, fire, throw, interact, attack <dir>, autoexplore, autoattack, inventory, equipment, character, skills, abilities, quests, journal, worldnav, save";
             }
         }
 
