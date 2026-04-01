@@ -48,6 +48,7 @@ public class AgentPoller : UE.MonoBehaviour
     float pollInterval = 0.5f;
 
     string CommandPath;
+    string RequestPath;
     bool initialized = false;
 
     void Awake()
@@ -60,7 +61,9 @@ public class AgentPoller : UE.MonoBehaviour
         if (!initialized)
         {
             string home = System.Environment.GetFolderPath(System.Environment.SpecialFolder.UserProfile);
-            CommandPath = System.IO.Path.Combine(home, "mud-daemon-gamestate", "mud-daemon", "data", "qud", "ipc", "command.txt");
+            string ipcDir = System.IO.Path.Combine(home, "mud-daemon-gamestate", "mud-daemon", "data", "qud", "ipc");
+            CommandPath = System.IO.Path.Combine(ipcDir, "command.txt");
+            RequestPath = System.IO.Path.Combine(ipcDir, "request.json");
             initialized = true;
         }
 
@@ -315,10 +318,30 @@ public class AgentPoller : UE.MonoBehaviour
             catch {}
         }
 
-        // If a command file exists, process it directly
-        // Since Update() runs every frame even in background (runInBackground=true),
-        // we can process commands and update state without needing turn advancement
-        if (System.IO.File.Exists(CommandPath))
+        // ── Typed harness protocol: request.json (preferred) ──────────────
+        // Check for request.json FIRST. If present, process via typed protocol
+        // and write response.json. Falls back to legacy command.txt below.
+        if (System.IO.File.Exists(RequestPath))
+        {
+            try
+            {
+                var player = XRLCore.Core?.Game?.Player?.Body;
+                if (player != null)
+                {
+                    string requestJson = System.IO.File.ReadAllText(RequestPath).Trim();
+                    System.IO.File.Delete(RequestPath);
+                    if (!string.IsNullOrEmpty(requestJson))
+                    {
+                        AgentBridgePart.ProcessRequest(player, requestJson);
+                        AgentBridgePart.WriteStateStatic(player);
+                    }
+                }
+            }
+            catch { }
+        }
+        // ── Legacy protocol: command.txt ──────────────────────────────────
+        // If no request.json, process command.txt via existing flow.
+        else if (System.IO.File.Exists(CommandPath))
         {
             try
             {
@@ -354,7 +377,13 @@ public class AgentBridgePart : IPart
     static string CommandPath;
     static string ResultPath;
     static string ScreenPath;
+    static string RequestPath;   // request.json (typed harness protocol)
+    static string ResponsePath;  // response.json (typed harness protocol)
     static bool DirCreated = false;
+
+    // Monotonic state version counter — increments every time state is written.
+    // Resets on game restart (session-scoped).
+    static long _stateVersion = 0;
 
     // Conversation state (XML-based)
     static System.Xml.XmlNode _currentConvXml;
@@ -388,6 +417,8 @@ public class AgentBridgePart : IPart
         CommandPath = Path.Combine(IpcDir, "command.txt");
         ResultPath = Path.Combine(IpcDir, "result.json");
         ScreenPath = Path.Combine(IpcDir, "screen.txt");
+        RequestPath = Path.Combine(IpcDir, "request.json");
+        ResponsePath = Path.Combine(IpcDir, "response.json");
         try { Directory.CreateDirectory(IpcDir); } catch { }
         DirCreated = true;
     }
@@ -427,7 +458,10 @@ public class AgentBridgePart : IPart
         EnsureDir();
         if (player == null) return;
 
+        _stateVersion++;
+
         var state = new Dictionary<string, object>();
+        state["stateVersion"] = _stateVersion;
 
         // Player Stats
         var stats = new Dictionary<string, object>();
@@ -1997,5 +2031,627 @@ public class AgentBridgePart : IPart
         EnsureDir();
         try { File.AppendAllText(Path.Combine(IpcDir, "error.log"), $"[{DateTime.Now}] [{ctx}] {ex}\n\n"); }
         catch { }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // TYPED HARNESS PROTOCOL — request.json / response.json
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Translate a typed action dictionary to a legacy command string.
+    /// The typed action has a "type" key and additional parameters.
+    /// Returns the command string that ExecuteCommand() understands.
+    /// </summary>
+    public static string TranslateTypedAction(Dictionary<string, object> action)
+    {
+        if (action == null || !action.ContainsKey("type"))
+            return null;
+
+        string type = action["type"]?.ToString() ?? "";
+
+        switch (type)
+        {
+            case "movement.step":
+            {
+                string direction = action.ContainsKey("direction") ? action["direction"]?.ToString() ?? "" : "";
+                return "move " + direction;
+            }
+            case "movement.path_to":
+            {
+                if (action.ContainsKey("target"))
+                    return "navigate " + action["target"]?.ToString();
+                if (action.ContainsKey("x") && action.ContainsKey("y"))
+                    return "navigate " + action["x"] + " " + action["y"];
+                return null;
+            }
+            case "interaction.talk":
+            {
+                string target = action.ContainsKey("target") ? action["target"]?.ToString() ?? "" : "";
+                return "talkto " + target;
+            }
+            case "interaction.choose_dialogue":
+            {
+                string choice = action.ContainsKey("choice") ? action["choice"]?.ToString() ?? "0" : "0";
+                return "choose " + choice;
+            }
+            case "combat.melee":
+            {
+                if (action.ContainsKey("direction"))
+                    return "move " + action["direction"]?.ToString();
+                if (action.ContainsKey("target"))
+                    return "navigate " + action["target"]?.ToString();
+                return null;
+            }
+            case "inventory.consume_food":
+                return "eat";
+            case "inventory.consume_water":
+                return "drink";
+            case "inventory.equip":
+            {
+                string item = action.ContainsKey("item") ? action["item"]?.ToString() ?? "" : "";
+                return "equip " + item;
+            }
+            case "inventory.pickup":
+            {
+                string item = action.ContainsKey("item") ? action["item"]?.ToString() ?? "" : "";
+                return "pickup " + item;
+            }
+            case "observe.examine":
+            {
+                string target = action.ContainsKey("target") ? action["target"]?.ToString() ?? "" : "";
+                return "examine " + target;
+            }
+            case "interact.trade":
+            {
+                string target = action.ContainsKey("target") ? action["target"]?.ToString() ?? "" : "";
+                return "trade " + target;
+            }
+            case "ability.activate":
+            {
+                string ability = action.ContainsKey("ability") ? action["ability"]?.ToString() ?? "" : "";
+                return "activate " + ability;
+            }
+            case "system.save":
+                return "save";
+            case "system.status":
+                return "status";
+            case "survival.rest":
+                return "rest";
+            default:
+                return null;
+        }
+    }
+
+    /// <summary>
+    /// Navigate a dot-separated path through a nested dictionary / list structure.
+    /// Returns the value at the path, or null if not found.
+    /// </summary>
+    static object ResolveStatePath(Dictionary<string, object> state, string path)
+    {
+        if (state == null || string.IsNullOrEmpty(path))
+            return null;
+
+        string[] segments = path.Split('.');
+        object current = state;
+
+        foreach (string seg in segments)
+        {
+            if (current == null) return null;
+
+            // Try dictionary access
+            if (current is Dictionary<string, object> dict)
+            {
+                if (dict.ContainsKey(seg))
+                    current = dict[seg];
+                else
+                    return null;
+            }
+            else if (current is Dictionary<string, string> sdict)
+            {
+                if (sdict.ContainsKey(seg))
+                    current = sdict[seg];
+                else
+                    return null;
+            }
+            else if (current is Dictionary<string, int> idict)
+            {
+                if (idict.ContainsKey(seg))
+                    current = idict[seg];
+                else
+                    return null;
+            }
+            else if (current is Dictionary<string, bool> bdict)
+            {
+                if (bdict.ContainsKey(seg))
+                    current = bdict[seg];
+                else
+                    return null;
+            }
+            // Try list access by numeric index
+            else if (current is System.Collections.IList list)
+            {
+                if (int.TryParse(seg, out int idx) && idx >= 0 && idx < list.Count)
+                    current = list[idx];
+                else
+                    return null;
+            }
+            else
+            {
+                // Try reflection as last resort
+                try
+                {
+                    var prop = current.GetType().GetProperty(seg);
+                    if (prop != null)
+                    {
+                        current = prop.GetValue(current);
+                        continue;
+                    }
+                    var field = current.GetType().GetField(seg);
+                    if (field != null)
+                    {
+                        current = field.GetValue(current);
+                        continue;
+                    }
+                }
+                catch { }
+                return null;
+            }
+        }
+
+        return current;
+    }
+
+    /// <summary>
+    /// Evaluate a list of assertions against the current game state.
+    /// Each assertion has a "path" (dot-separated), and a condition
+    /// (equals, greaterThan, lessThan, contains, notEmpty).
+    /// Returns a list of assertion result dictionaries.
+    /// </summary>
+    static List<Dictionary<string, object>> EvaluateAssertions(
+        Dictionary<string, object> state,
+        List<Dictionary<string, object>> assertions)
+    {
+        var results = new List<Dictionary<string, object>>();
+        if (assertions == null) return results;
+
+        foreach (var assertion in assertions)
+        {
+            var aResult = new Dictionary<string, object>();
+            string path = assertion.ContainsKey("path") ? assertion["path"]?.ToString() ?? "" : "";
+            aResult["path"] = path;
+
+            object actual = ResolveStatePath(state, path);
+            aResult["actualValue"] = actual ?? "(null)";
+            bool passed = false;
+
+            try
+            {
+                if (assertion.ContainsKey("equals"))
+                {
+                    object expected = assertion["equals"];
+                    aResult["condition"] = "equals";
+                    aResult["expected"] = expected;
+                    if (actual == null)
+                        passed = expected == null;
+                    else if (expected is bool expectedBool)
+                        passed = (actual is bool ab && ab == expectedBool)
+                              || actual.ToString().Equals(expectedBool.ToString(), StringComparison.OrdinalIgnoreCase);
+                    else if (expected is long expectedLong)
+                        passed = Convert.ToInt64(actual) == expectedLong;
+                    else if (expected is double expectedDouble)
+                        passed = Math.Abs(Convert.ToDouble(actual) - expectedDouble) < 0.001;
+                    else
+                        passed = actual.ToString().Equals(expected.ToString(), StringComparison.OrdinalIgnoreCase);
+                }
+                else if (assertion.ContainsKey("greaterThan"))
+                {
+                    aResult["condition"] = "greaterThan";
+                    double threshold = Convert.ToDouble(assertion["greaterThan"]);
+                    aResult["expected"] = threshold;
+                    passed = Convert.ToDouble(actual) > threshold;
+                }
+                else if (assertion.ContainsKey("lessThan"))
+                {
+                    aResult["condition"] = "lessThan";
+                    double threshold = Convert.ToDouble(assertion["lessThan"]);
+                    aResult["expected"] = threshold;
+                    passed = Convert.ToDouble(actual) < threshold;
+                }
+                else if (assertion.ContainsKey("contains"))
+                {
+                    aResult["condition"] = "contains";
+                    string needle = assertion["contains"]?.ToString() ?? "";
+                    aResult["expected"] = needle;
+
+                    if (actual is System.Collections.IList list)
+                    {
+                        foreach (var item in list)
+                        {
+                            if (item == null) continue;
+                            // For list of dicts (e.g. quests), check "name" field
+                            if (item is Dictionary<string, string> sd && sd.ContainsKey("name") &&
+                                sd["name"].IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0)
+                            { passed = true; break; }
+                            if (item is Dictionary<string, object> od && od.ContainsKey("name") &&
+                                od["name"]?.ToString()?.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0)
+                            { passed = true; break; }
+                            if (item.ToString().IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0)
+                            { passed = true; break; }
+                        }
+                    }
+                    else if (actual is string s)
+                    {
+                        passed = s.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
+                    }
+                    else if (actual != null)
+                    {
+                        passed = actual.ToString().IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
+                    }
+                }
+                else if (assertion.ContainsKey("notEmpty"))
+                {
+                    aResult["condition"] = "notEmpty";
+                    if (actual is System.Collections.IList list)
+                        passed = list.Count > 0;
+                    else if (actual is string s)
+                        passed = !string.IsNullOrEmpty(s);
+                    else
+                        passed = actual != null;
+                }
+            }
+            catch (Exception ex)
+            {
+                aResult["error"] = ex.Message;
+            }
+
+            aResult["passed"] = passed;
+            results.Add(aResult);
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Process a typed request (request.json) and write response.json.
+    /// This is the entry point for the typed harness protocol.
+    /// </summary>
+    public static void ProcessRequest(GameObject player, string requestJson)
+    {
+        EnsureDir();
+
+        var response = new Dictionary<string, object>();
+        string commandId = null;
+        long issuedAgainstVersion = -1;
+
+        try
+        {
+            var request = JsonConvert.DeserializeObject<Dictionary<string, object>>(requestJson);
+            if (request == null)
+            {
+                response["status"] = "error";
+                response["failures"] = new List<string> { "Could not parse request JSON" };
+                WriteResponse(response);
+                return;
+            }
+
+            // Extract envelope fields
+            commandId = request.ContainsKey("commandId") ? request["commandId"]?.ToString() : null;
+            response["commandId"] = commandId;
+
+            if (request.ContainsKey("issuedAgainstStateVersion"))
+            {
+                try { issuedAgainstVersion = Convert.ToInt64(request["issuedAgainstStateVersion"]); }
+                catch { }
+            }
+            response["issuedAgainstStateVersion"] = issuedAgainstVersion;
+
+            // Stale-state warning: if issued version is more than 10 behind current
+            var warnings = new List<string>();
+            if (issuedAgainstVersion >= 0 && (_stateVersion - issuedAgainstVersion) > 10)
+            {
+                warnings.Add($"Request was issued against stateVersion {issuedAgainstVersion} but current is {_stateVersion} (>{10} versions behind). State may have changed significantly.");
+            }
+
+            // Parse the inner request
+            object reqObj = request.ContainsKey("request") ? request["request"] : null;
+            Dictionary<string, object> innerRequest = null;
+
+            if (reqObj is Newtonsoft.Json.Linq.JObject jObj)
+                innerRequest = jObj.ToObject<Dictionary<string, object>>();
+            else if (reqObj is Dictionary<string, object> dict)
+                innerRequest = dict;
+
+            if (innerRequest == null)
+            {
+                response["status"] = "error";
+                response["failures"] = new List<string> { "Missing or invalid 'request' object in envelope" };
+                if (warnings.Count > 0) response["warnings"] = warnings;
+                WriteResponse(response);
+                return;
+            }
+
+            string kind = innerRequest.ContainsKey("kind") ? innerRequest["kind"]?.ToString() : null;
+            var effectsList = new List<string>();
+            var failuresList = new List<string>();
+
+            switch (kind)
+            {
+                case "perform_action":
+                {
+                    // Extract the typed action and translate to command string
+                    object actionObj = innerRequest.ContainsKey("action") ? innerRequest["action"] : null;
+                    Dictionary<string, object> actionDict = null;
+
+                    if (actionObj is Newtonsoft.Json.Linq.JObject aJObj)
+                        actionDict = aJObj.ToObject<Dictionary<string, object>>();
+                    else if (actionObj is Dictionary<string, object> aDict)
+                        actionDict = aDict;
+
+                    if (actionDict == null)
+                    {
+                        response["status"] = "error";
+                        failuresList.Add("Missing or invalid 'action' object in perform_action request");
+                        break;
+                    }
+
+                    string cmdString = TranslateTypedAction(actionDict);
+                    if (cmdString == null)
+                    {
+                        response["status"] = "error";
+                        failuresList.Add("Unknown action type: " + (actionDict.ContainsKey("type") ? actionDict["type"]?.ToString() : "(none)"));
+                        break;
+                    }
+
+                    // Execute via existing command pipeline
+                    var cmdResult = ExecuteCommand(player, cmdString);
+                    response["status"] = cmdResult.ContainsKey("status") ? cmdResult["status"]?.ToString() ?? "error" : "error";
+                    response["result"] = cmdResult;
+
+                    // Detect effects from the result
+                    if (cmdResult.ContainsKey("conversationId")) effectsList.Add("conversation_opened");
+                    if (cmdResult.ContainsKey("npcText")) effectsList.Add("dialogue_received");
+                    if (cmdResult.ContainsKey("choices")) effectsList.Add("choices_available");
+                    if (cmdResult.ContainsKey("moved")) effectsList.Add("moved");
+                    if (cmdResult.ContainsKey("equipped")) effectsList.Add("item_equipped");
+                    if (cmdResult.ContainsKey("picked")) effectsList.Add("item_picked_up");
+                    if (cmdResult.ContainsKey("consumed")) effectsList.Add("item_consumed");
+                    if (cmdResult.ContainsKey("activated")) effectsList.Add("ability_activated");
+                    if (cmdResult.ContainsKey("questActions")) effectsList.Add("quest_updated");
+                    if (cmdResult.ContainsKey("target") && (cmdString.StartsWith("navigate") || cmdString.StartsWith("attack")))
+                        effectsList.Add("navigation_completed");
+                    break;
+                }
+
+                case "assert_state":
+                {
+                    // Build fresh state to evaluate assertions against
+                    // We call WriteStateStatic which writes to file; read the state by
+                    // building it inline instead (to avoid double-write)
+                    WriteStateStatic(player);
+                    string stateJson = null;
+                    try { stateJson = File.ReadAllText(StatePath); }
+                    catch { }
+
+                    Dictionary<string, object> currentState = null;
+                    if (stateJson != null)
+                    {
+                        try { currentState = JsonConvert.DeserializeObject<Dictionary<string, object>>(stateJson); }
+                        catch { }
+                    }
+
+                    if (currentState == null)
+                    {
+                        response["status"] = "error";
+                        failuresList.Add("Could not read current game state for assertion evaluation");
+                        break;
+                    }
+
+                    // Parse assertions list
+                    object assertionsObj = innerRequest.ContainsKey("assertions") ? innerRequest["assertions"] : null;
+                    List<Dictionary<string, object>> assertionsList = null;
+
+                    if (assertionsObj is Newtonsoft.Json.Linq.JArray jArr)
+                    {
+                        assertionsList = new List<Dictionary<string, object>>();
+                        foreach (var item in jArr)
+                        {
+                            if (item is Newtonsoft.Json.Linq.JObject jo)
+                                assertionsList.Add(jo.ToObject<Dictionary<string, object>>());
+                        }
+                    }
+                    else if (assertionsObj is List<Dictionary<string, object>> aList)
+                    {
+                        assertionsList = aList;
+                    }
+
+                    if (assertionsList == null || assertionsList.Count == 0)
+                    {
+                        response["status"] = "error";
+                        failuresList.Add("No assertions provided in assert_state request");
+                        break;
+                    }
+
+                    // Evaluate
+                    // Need to deserialize the state more deeply for nested dict traversal.
+                    // JObjects from Newtonsoft need conversion.
+                    Dictionary<string, object> deepState = DeepConvertJObjects(currentState);
+                    var assertionResults = EvaluateAssertions(deepState, assertionsList);
+                    response["result"] = new Dictionary<string, object> { ["assertions"] = assertionResults };
+                    bool allPassed = true;
+                    foreach (var ar in assertionResults)
+                    {
+                        if (ar.ContainsKey("passed") && ar["passed"] is bool p && !p)
+                        { allPassed = false; break; }
+                    }
+                    response["status"] = allPassed ? "succeeded" : "failed";
+                    if (!allPassed)
+                    {
+                        foreach (var ar in assertionResults)
+                        {
+                            if (ar.ContainsKey("passed") && ar["passed"] is bool p2 && !p2)
+                                failuresList.Add("Assertion failed: " + (ar.ContainsKey("path") ? ar["path"] : "?") +
+                                    " (" + (ar.ContainsKey("condition") ? ar["condition"] : "?") + ")");
+                        }
+                    }
+                    effectsList.Add("state_asserted");
+                    break;
+                }
+
+                case "checkpoint_save":
+                {
+                    var saveResult = ExecuteCommand(player, "save");
+                    response["status"] = saveResult.ContainsKey("status") ? saveResult["status"]?.ToString() ?? "ok" : "ok";
+                    response["result"] = saveResult;
+                    effectsList.Add("game_saved");
+                    break;
+                }
+
+                case "wait_until":
+                {
+                    // Evaluate a condition against current state and report whether it's met.
+                    // Does NOT block — the harness is responsible for polling.
+                    WriteStateStatic(player);
+                    string stateJson2 = null;
+                    try { stateJson2 = File.ReadAllText(StatePath); }
+                    catch { }
+
+                    Dictionary<string, object> currentState2 = null;
+                    if (stateJson2 != null)
+                    {
+                        try { currentState2 = JsonConvert.DeserializeObject<Dictionary<string, object>>(stateJson2); }
+                        catch { }
+                    }
+
+                    if (currentState2 == null)
+                    {
+                        response["status"] = "error";
+                        failuresList.Add("Could not read current state for wait_until evaluation");
+                        break;
+                    }
+
+                    Dictionary<string, object> deepState2 = DeepConvertJObjects(currentState2);
+
+                    // The condition is provided as a single assertion
+                    object condObj = innerRequest.ContainsKey("condition") ? innerRequest["condition"] : null;
+                    Dictionary<string, object> condDict = null;
+                    if (condObj is Newtonsoft.Json.Linq.JObject cJObj)
+                        condDict = cJObj.ToObject<Dictionary<string, object>>();
+                    else if (condObj is Dictionary<string, object> cDict)
+                        condDict = cDict;
+
+                    if (condDict == null)
+                    {
+                        response["status"] = "error";
+                        failuresList.Add("Missing 'condition' in wait_until request");
+                        break;
+                    }
+
+                    var condResults = EvaluateAssertions(deepState2, new List<Dictionary<string, object>> { condDict });
+                    bool condMet = condResults.Count > 0 && condResults[0].ContainsKey("passed") && condResults[0]["passed"] is bool cp && cp;
+
+                    response["result"] = new Dictionary<string, object>
+                    {
+                        ["conditionMet"] = condMet,
+                        ["evaluation"] = condResults.Count > 0 ? condResults[0] : null
+                    };
+                    response["status"] = condMet ? "succeeded" : "failed";
+                    if (condMet) effectsList.Add("condition_met");
+                    break;
+                }
+
+                default:
+                {
+                    response["status"] = "error";
+                    failuresList.Add("Unknown request kind: " + (kind ?? "(null)"));
+                    break;
+                }
+            }
+
+            response["effects"] = effectsList;
+            response["failures"] = failuresList;
+            if (warnings.Count > 0) response["warnings"] = warnings;
+
+            // Capture events that were emitted during processing
+            response["events"] = _pendingEvents.ToList();
+        }
+        catch (Exception ex)
+        {
+            response["commandId"] = commandId;
+            response["status"] = "error";
+            response["failures"] = new List<string> { "Exception processing request: " + ex.Message };
+            try { File.AppendAllText(Path.Combine(IpcDir, "error.log"),
+                $"[{DateTime.Now}] [ProcessRequest] {ex}\n\n"); } catch { }
+        }
+
+        // Always include observed state version after processing
+        response["observedStateVersionAfter"] = _stateVersion;
+
+        WriteResponse(response);
+    }
+
+    /// <summary>
+    /// Write the response.json file atomically.
+    /// </summary>
+    static void WriteResponse(Dictionary<string, object> response)
+    {
+        EnsureDir();
+        try
+        {
+            string json = JsonConvert.SerializeObject(response, Formatting.Indented);
+            string tmp = ResponsePath + ".tmp";
+            File.WriteAllText(tmp, json);
+            if (File.Exists(ResponsePath)) File.Delete(ResponsePath);
+            File.Move(tmp, ResponsePath);
+        }
+        catch (Exception ex)
+        {
+            try { File.AppendAllText(Path.Combine(IpcDir, "error.log"),
+                $"[{DateTime.Now}] [WriteResponse] {ex}\n\n"); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// Recursively convert Newtonsoft JObject/JArray/JValue instances
+    /// into plain Dictionary/List/primitive types so that ResolveStatePath
+    /// can traverse them without needing JObject-specific handling.
+    /// </summary>
+    static Dictionary<string, object> DeepConvertJObjects(Dictionary<string, object> source)
+    {
+        if (source == null) return null;
+        var result = new Dictionary<string, object>();
+        foreach (var kv in source)
+        {
+            result[kv.Key] = DeepConvertValue(kv.Value);
+        }
+        return result;
+    }
+
+    static object DeepConvertValue(object value)
+    {
+        if (value == null) return null;
+
+        if (value is Newtonsoft.Json.Linq.JObject jObj)
+        {
+            var dict = new Dictionary<string, object>();
+            foreach (var prop in jObj.Properties())
+                dict[prop.Name] = DeepConvertValue(prop.Value);
+            return dict;
+        }
+        if (value is Newtonsoft.Json.Linq.JArray jArr)
+        {
+            var list = new List<object>();
+            foreach (var item in jArr)
+                list.Add(DeepConvertValue(item));
+            return list;
+        }
+        if (value is Newtonsoft.Json.Linq.JValue jVal)
+        {
+            return jVal.Value;
+        }
+        if (value is Dictionary<string, object> dict2)
+        {
+            return DeepConvertJObjects(dict2);
+        }
+        return value;
     }
 }

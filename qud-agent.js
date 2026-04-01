@@ -1,19 +1,18 @@
 #!/usr/bin/env node
 'use strict';
 // qud-agent.js — Autonomous Caves of Qud agent.
-// Communicates directly with the game via command.txt/result.json (no daemon needed).
+// Communicates with the game via the typed harness protocol (request.json/response.json),
+// with automatic fallback to legacy command.txt/result.json.
 // Uses Claude CLI as the decision engine.
 // Usage: node qud-agent.js [--turns N] [--model MODEL]
 
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { HarnessClient } = require('./harness-client');
 
 // --- Config ---
 const IPC_DIR = path.join(__dirname, 'mud-daemon', 'data', 'qud', 'ipc');
-const STATE_PATH = path.join(IPC_DIR, 'state.json');
-const COMMAND_PATH = path.join(IPC_DIR, 'command.txt');
-const RESULT_PATH = path.join(IPC_DIR, 'result.json');
 const JOURNAL_PATH = path.join(__dirname, 'qud-journal.json');
 const REPORT_DIR = path.join(__dirname, 'reports');
 
@@ -24,35 +23,27 @@ const BASE_MODEL = 'haiku';
 
 fs.mkdirSync(REPORT_DIR, { recursive: true });
 
-// --- Direct game IPC ---
-function sendCommand(cmd) {
-  // Popup dismissal handled by C# mod (AgentBridge reflection-based approach)
-  // Clear old result first
-  try { fs.unlinkSync(RESULT_PATH); } catch {}
-  // Write command atomically
-  const tmp = COMMAND_PATH + '.tmp';
-  fs.writeFileSync(tmp, cmd);
-  fs.renameSync(tmp, COMMAND_PATH);
-}
+// --- Harness client (typed protocol with legacy fallback) ---
+const harness = new HarnessClient(IPC_DIR);
 
-async function waitForResult(timeoutMs = 15000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    try {
-      if (fs.existsSync(RESULT_PATH)) {
-        const raw = fs.readFileSync(RESULT_PATH, 'utf8');
-        return JSON.parse(raw);
-      }
-    } catch { /* mid-write, retry */ }
-    await sleep(300);
-  }
-  return { status: 'timeout', error: 'No result within timeout' };
-}
-
+/**
+ * Execute a single game command. Accepts either:
+ *   - A typed action object: {type: "movement.step", direction: "n"}
+ *   - A raw command string: "move n" (sent via legacy path or converted to typed action)
+ * @param {string|object} cmd
+ * @param {number} [timeoutMs]
+ * @returns {Promise<object>}
+ */
 async function executeStep(cmd, timeoutMs = 15000) {
-  sendCommand(cmd);
-  const result = await waitForResult(timeoutMs);
-  // Read fresh state after command
+  let result;
+  if (typeof cmd === 'object' && cmd.type) {
+    // Typed action — use harness performAction (tries typed protocol, falls back to legacy)
+    result = await harness.performAction(cmd, { timeout: timeoutMs });
+  } else {
+    // Raw string command — use legacy command.txt path directly
+    result = await harness.sendLegacyCommand(String(cmd), timeoutMs);
+  }
+  // Brief pause for game to settle
   await sleep(500);
   return result;
 }
@@ -111,7 +102,7 @@ async function modeHunt(maxSteps = 15) {
     // Emergency heal
     if (state.hp < state.maxHp * 0.3) {
       log('HUNT', `LOW HP (${state.hp}/${state.maxHp}) — eating and fleeing`);
-      await executeStep('eat');
+      await harness.eat();
       events.push(`Healed at HP ${state.hp}/${state.maxHp}`);
       break;
     }
@@ -120,7 +111,7 @@ async function modeHunt(maxSteps = 15) {
     const hostiles = (state.entities || []).filter(e => e.hostile);
     if (hostiles.length === 0) {
       log('HUNT', 'No hostiles in zone. Trying autoexplore.');
-      const r = await executeStep('move e');
+      await harness.move('e');
       await sleep(300);
       continue;
     }
@@ -133,7 +124,7 @@ async function modeHunt(maxSteps = 15) {
 
     if (dist > 1) {
       // Navigate to target
-      const r = await executeStep(`navigate ${target.x} ${target.y}`);
+      const r = await harness.navigateTo({ x: target.x, y: target.y });
       if (r.status === 'error') {
         // Manual movement toward target
         const dx = target.x - state.position.x;
@@ -143,7 +134,7 @@ async function modeHunt(maxSteps = 15) {
         if (dy > 0) dir += 's';
         if (dx > 0) dir += 'e';
         if (dx < 0) dir += 'w';
-        await executeStep(`move ${dir || 'n'}`);
+        await harness.move(dir || 'n');
       }
     } else {
       // In Qud, you attack by moving INTO the hostile creature
@@ -156,7 +147,7 @@ async function modeHunt(maxSteps = 15) {
       else if (dx < 0) dir += 'w';
       if (!dir) dir = 'n';
 
-      const r = await executeStep(`move ${dir}`);
+      await harness.move(dir);
       events.push(`Attacked ${target.name} (move ${dir})`);
 
       // Check if target died
@@ -169,7 +160,7 @@ async function modeHunt(maxSteps = 15) {
         events.push(`Killed ${target.name}!`);
         log('HUNT', `KILL: ${target.name}`);
         // Try to pick up loot
-        await executeStep(`navigate ${target.x} ${target.y}`);
+        await harness.navigateTo({ x: target.x, y: target.y });
         await sleep(300);
       }
     }
@@ -194,7 +185,7 @@ async function modeExplore(maxSteps = 20) {
     // Emergency check
     if (state.hp < state.maxHp * 0.3) {
       log('EXPL', `LOW HP — stopping exploration`);
-      await executeStep('eat');
+      await harness.eat();
       events.push('Stopped: low HP');
       break;
     }
@@ -226,12 +217,12 @@ async function modeExplore(maxSteps = 20) {
     // Move in a pattern — explore edges then center
     const dirs = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'];
     const dir = dirs[i % dirs.length];
-    const r = await executeStep(`move ${dir}`);
+    const r = await harness.move(dir);
     if (r.status === 'ok' || r.moved) tilesExplored++;
 
     // Check for items on ground periodically
     if (i % 5 === 0) {
-      await executeStep('look');
+      await harness.examine('surroundings');
     }
 
     await sleep(300);
@@ -248,13 +239,13 @@ async function modeHeal() {
 
   const events = [];
   if (state.hp < state.maxHp) {
-    await executeStep('eat');
+    await harness.eat();
     events.push('Ate food');
     await sleep(500);
-    await executeStep('drink');
+    await harness.drink();
     events.push('Drank water');
     await sleep(500);
-    await executeStep('rest');
+    await harness.rest();
     events.push('Resting...');
     await sleep(2000);
   }
@@ -270,14 +261,14 @@ async function modeShop(merchantName) {
   const events = [];
 
   // Navigate to merchant
-  const navResult = await executeStep(`navigate ${merchantName}`);
+  const navResult = await harness.navigateTo(merchantName);
   if (navResult.status === 'error') {
     events.push(`Could not reach ${merchantName}: ${navResult.message}`);
     return { mode: 'shop', events };
   }
 
   // View their inventory
-  const tradeResult = await executeStep(`trade ${merchantName}`);
+  const tradeResult = await harness.trade(merchantName);
   if (tradeResult.items) {
     events.push(`${merchantName} has ${tradeResult.items.length} items`);
     log('SHOP', `${tradeResult.items.length} items available`);
@@ -301,13 +292,9 @@ async function executeMode(mode, params = {}) {
   }
 }
 
-// --- State reading ---
+// --- State reading (via harness client) ---
 function readState() {
-  try {
-    return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
-  } catch {
-    return null;
-  }
+  return harness.readState();
 }
 
 // --- Journal ---
@@ -841,9 +828,9 @@ async function main() {
     // Check HP - emergency heal
     if (state.hp < state.maxHp * 0.5 && state.hp > 0) {
       log('AGENT', 'LOW HP — auto-healing');
-      await executeStep('eat');
+      await harness.eat();
       await sleep(500);
-      await executeStep('rest');
+      await harness.rest();
       await sleep(1000);
     }
 

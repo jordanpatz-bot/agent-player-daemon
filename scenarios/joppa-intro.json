@@ -1,0 +1,82 @@
+{
+  "name": "joppa_intro_quest_flow",
+  "description": "Talk to key NPCs in Joppa and accept starting quests",
+  "tags": ["joppa", "quests", "smoke-test"],
+  "steps": [
+    {
+      "name": "navigate_to_irudad",
+      "action": {"type": "movement.path_to", "target": "Elder Irudad"},
+      "onFail": "manual_walk",
+      "fallback": [
+        {"action": {"type": "movement.step", "direction": "n"}, "repeat": 19},
+        {"action": {"type": "movement.step", "direction": "ne"}}
+      ]
+    },
+    {
+      "name": "talk_to_irudad",
+      "action": {"type": "interaction.talk", "target": "Elder Irudad"},
+      "assert": {"path": "interaction.conversationActive", "equals": true}
+    },
+    {
+      "name": "ask_for_work",
+      "action": {"type": "interaction.choose_dialogue", "choice": 3},
+      "comment": "Choose 'I'm looking for work'"
+    },
+    {
+      "name": "save_after_irudad",
+      "action": {"type": "system.save"}
+    },
+    {
+      "name": "navigate_to_argyve",
+      "action": {"type": "movement.path_to", "target": "Argyve"}
+    },
+    {
+      "name": "talk_to_argyve",
+      "action": {"type": "interaction.talk", "target": "Argyve"},
+      "assert": {"path": "interaction.conversationActive", "equals": true}
+    },
+    {
+      "name": "advance_argyve_dialogue",
+      "action": {"type": "interaction.choose_dialogue", "choice": 0},
+      "repeat": 5,
+      "comment": "Advance through Argyve's mumbling intro"
+    },
+    {
+      "name": "accept_knickknack_quest",
+      "action": {"type": "interaction.choose_dialogue", "choice": 0},
+      "comment": "Accept the knickknack quest"
+    },
+    {
+      "name": "verify_argyve_quest_done",
+      "assert": [
+        {"path": "interaction.conversationActive", "equals": false}
+      ]
+    },
+    {
+      "name": "navigate_to_mehmet",
+      "action": {"type": "movement.path_to", "target": "Mehmet"}
+    },
+    {
+      "name": "talk_to_mehmet",
+      "action": {"type": "interaction.talk", "target": "Mehmet"},
+      "assert": {"path": "interaction.conversationActive", "equals": true}
+    },
+    {
+      "name": "advance_mehmet_dialogue",
+      "action": {"type": "interaction.choose_dialogue", "choice": 0},
+      "repeat": 3,
+      "comment": "Advance through Mehmet's dialogue about vermin"
+    },
+    {
+      "name": "verify_mehmet_done",
+      "assert": [
+        {"path": "interaction.conversationActive", "equals": false}
+      ]
+    },
+    {
+      "name": "save_after_quests",
+      "action": {"type": "system.save"},
+      "comment": "Save after completing all Joppa quest conversations"
+    }
+  ]
+}
