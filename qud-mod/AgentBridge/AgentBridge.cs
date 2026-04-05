@@ -636,41 +636,201 @@ public class AgentBridgePart : IPart
         catch { }
         state["effects"] = effects;
 
-        // Active quests
-        var quests = new List<Dictionary<string, string>>();
+        // Active quests — read from The.Game quest system
+        var quests = new List<Dictionary<string, object>>();
+        var _questDebug = new List<string>();
         try
         {
-            var questList = Qud.API.JournalAPI.GetMapNotes(n => n.Category == "quest");
-            if (questList != null)
+            var game = The.Game;
+            if (game != null)
             {
-                foreach (var q in questList)
+                _questDebug.Add("game_type:" + game.GetType().FullName);
+
+                // Enumerate all quest-related members on the game object
+                foreach (var prop in game.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic))
                 {
-                    quests.Add(new Dictionary<string, string>
+                    string n = prop.Name.ToLowerInvariant();
+                    if (n.Contains("quest")) _questDebug.Add("prop:" + prop.Name + "(" + prop.PropertyType.Name + ")");
+                }
+                foreach (var field in game.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic))
+                {
+                    string n = field.Name.ToLowerInvariant();
+                    if (n.Contains("quest")) _questDebug.Add("field:" + field.Name + "(" + field.FieldType.Name + ")");
+                }
+                foreach (var meth in game.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    string n = meth.Name.ToLowerInvariant();
+                    if (n.Contains("quest"))
                     {
-                        ["name"] = q.Text ?? "?",
-                        ["category"] = q.Category ?? "",
-                    });
+                        var parms = meth.GetParameters();
+                        string sig = string.Join(",", parms.Select(p => p.ParameterType.Name));
+                        _questDebug.Add("method:" + meth.Name + "(" + sig + ")=>" + meth.ReturnType.Name);
+                    }
                 }
-            }
-        }
-        catch { }
-        // Fallback: try game's quest manager directly
-        if (quests.Count == 0)
-        {
-            try
-            {
-                var qm = player.GetPart("QuestManager");
-                if (qm != null)
+
+                // Try multiple access patterns for the quest dictionary
+                object questsDict = null;
+
+                // Pattern 1: Public property
+                questsDict = game.GetType().GetProperty("Quests", BindingFlags.Public | BindingFlags.Instance)?.GetValue(game);
+
+                // Pattern 2: Public field
+                if (questsDict == null)
+                    questsDict = game.GetType().GetField("Quests", BindingFlags.Public | BindingFlags.Instance)?.GetValue(game);
+
+                // Pattern 3: Non-public
+                if (questsDict == null)
+                    questsDict = game.GetType().GetProperty("Quests", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(game);
+                if (questsDict == null)
+                    questsDict = game.GetType().GetField("Quests", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(game);
+
+                // Pattern 4: Try HasQuest to verify quests exist even if we can't enumerate
+                if (questsDict == null)
                 {
-                    var ql = qm.GetType().GetProperty("Quests")?.GetValue(qm) as System.Collections.IDictionary;
-                    if (ql != null)
-                        foreach (var key in ql.Keys)
-                            quests.Add(new Dictionary<string, string> { ["name"] = key.ToString() });
+                    // List known quest IDs and check each
+                    string[] knownQuests = { "What's Eating the Watervine?", "Fetch Argyve a Knickknack", "A Canticle for Barathrum" };
+                    foreach (string qid in knownQuests)
+                    {
+                        if (CheckQuestCondition("HasQuest", qid))
+                        {
+                            var qEntry = new Dictionary<string, object>
+                            {
+                                ["id"] = qid,
+                                ["name"] = qid,
+                                ["finished"] = CheckQuestCondition("HasFinishedQuest", qid),
+                                ["active"] = !CheckQuestCondition("HasFinishedQuest", qid)
+                            };
+                            quests.Add(qEntry);
+                        }
+                    }
+                }
+                // StringMap<Quest> — try IDictionary first, then IEnumerable<KeyValuePair>, then Keys enumeration
+                if (questsDict != null)
+                {
+                    _questDebug.Add("questsDict_type:" + questsDict.GetType().FullName);
+
+                    // Try to get Keys from the StringMap and iterate
+                    System.Collections.IEnumerable keys = null;
+                    try
+                    {
+                        keys = questsDict.GetType().GetProperty("Keys")?.GetValue(questsDict) as System.Collections.IEnumerable;
+                        if (keys != null)
+                        {
+                            int kc = 0; foreach (var k in keys) kc++;
+                            _questDebug.Add("keys_count:" + kc);
+                        }
+                        else _questDebug.Add("keys:null");
+                    }
+                    catch (Exception ex) { _questDebug.Add("keys_error:" + ex.Message); }
+
+                    // Also try Count property
+                    try
+                    {
+                        var countProp = questsDict.GetType().GetProperty("Count");
+                        if (countProp != null) _questDebug.Add("count:" + countProp.GetValue(questsDict));
+                    }
+                    catch { }
+
+                    // Iterate StringMap directly as IEnumerable<KeyValuePair<string, Quest>>
+                    // Extract both key and value from each entry
+                    var questEntries = new List<(string id, object quest)>();
+                    try
+                    {
+                        if (questsDict is System.Collections.IEnumerable enumerable)
+                        {
+                            foreach (var kvp in enumerable)
+                            {
+                                var kProp = kvp.GetType().GetProperty("Key");
+                                var vProp = kvp.GetType().GetProperty("Value");
+                                string k = kProp?.GetValue(kvp)?.ToString();
+                                object v = vProp?.GetValue(kvp);
+                                if (k != null && v != null) questEntries.Add((k, v));
+                            }
+                            _questDebug.Add("entries_from_enum:" + questEntries.Count);
+                        }
+                    }
+                    catch (Exception ex) { _questDebug.Add("enum_error:" + ex.Message); }
+
+                    // Fallback: probe known quests via HasQuest
+                    if (questEntries.Count == 0)
+                    {
+                        string[] known = { "What's Eating the Watervine?", "Fetch Argyve a Knickknack",
+                            "Fetch Argyve Another Knickknack", "A Canticle for Barathrum" };
+                        foreach (string qid in known)
+                        {
+                            if (CheckQuestCondition("HasQuest", qid))
+                            {
+                                // Use TryGetQuest to get the quest object
+                                object questObj = null;
+                                try
+                                {
+                                    var tgq = game.GetType().GetMethod("TryGetQuest");
+                                    if (tgq != null)
+                                    {
+                                        var args = new object[] { qid, null };
+                                        bool found = (bool)tgq.Invoke(game, args);
+                                        if (found) questObj = args[1];
+                                    }
+                                }
+                                catch { }
+                                questEntries.Add((qid, questObj));
+                            }
+                        }
+                        if (questEntries.Count > 0) _questDebug.Add("entries_from_probe:" + questEntries.Count);
+                    }
+
+                    foreach (var entry in questEntries)
+                    {
+                        string qId = entry.id;
+                        object quest = entry.quest;
+
+                            string qName = quest?.GetType().GetProperty("Name")?.GetValue(quest)?.ToString()
+                                        ?? quest?.GetType().GetProperty("DisplayName")?.GetValue(quest)?.ToString()
+                                        ?? qId;
+                            bool finished = false;
+                            try { finished = (bool)(quest.GetType().GetProperty("Finished")?.GetValue(quest) ?? false); } catch { }
+
+                            var qEntry = new Dictionary<string, object>
+                            {
+                                ["id"] = qId,
+                                ["name"] = qName,
+                                ["finished"] = finished
+                            };
+
+                            // Try to read quest steps
+                            var steps = new List<Dictionary<string, object>>();
+                            try
+                            {
+                                var stepsObj = quest.GetType().GetProperty("Steps")?.GetValue(quest)
+                                            ?? quest.GetType().GetField("Steps")?.GetValue(quest);
+                                System.Collections.IEnumerable stepKeys = null;
+                                try { stepKeys = stepsObj?.GetType().GetProperty("Keys")?.GetValue(stepsObj) as System.Collections.IEnumerable; } catch { }
+                                if (stepKeys != null)
+                                {
+                                    var stepIndexer = stepsObj.GetType().GetProperty("Item");
+                                    foreach (var sk in stepKeys)
+                                    {
+                                        object step = null;
+                                        try { step = stepIndexer?.GetValue(stepsObj, new object[] { sk.ToString() }); } catch { }
+                                        string sName = step?.GetType().GetProperty("Name")?.GetValue(step)?.ToString() ?? sk?.ToString() ?? "?";
+                                        bool sDone = false;
+                                        try { sDone = (bool)(step?.GetType().GetProperty("Finished")?.GetValue(step) ?? false); } catch { }
+                                        steps.Add(new Dictionary<string, object> { ["name"] = sName, ["finished"] = sDone });
+                                    }
+                                }
+                            }
+                            catch { }
+                            if (steps.Count > 0) qEntry["steps"] = steps;
+
+                            quests.Add(qEntry);
+                        }
+                    }
                 }
             }
-            catch { }
-        }
+        catch { }
         state["quests"] = quests;
+        // Uncomment for quest system debugging:
+        // if (_questDebug.Count > 0) state["_questDebug"] = _questDebug;
 
         // Known world locations from journal
         var knownLocations = new List<Dictionary<string, string>>();
@@ -691,23 +851,28 @@ public class AgentBridgePart : IPart
         } catch { }
         state["knownLocations"] = knownLocations;
 
-        // Recent messages — try to get from the game's message buffer
+        // Recent messages — read from GamePlayer.Messages (the MessageQueue instance)
+        // Path: XRLCore.Core.Game.Player.Messages → MessageQueue.Messages (List<string>)
         var messages = new List<string>();
         try
         {
-            object msgQueue = null;
-            try { msgQueue = typeof(XRL.Messages.MessageQueue).GetProperty("Static")?.GetValue(null); } catch { }
-            if (msgQueue != null)
+            var pgs = XRL.Core.XRLCore.Core?.Game?.Player;
+            if (pgs != null)
             {
-                var msgList = msgQueue.GetType().GetProperty("Messages")?.GetValue(msgQueue) as System.Collections.IEnumerable;
-                if (msgList != null)
+                var mqField = pgs.GetType().GetField("Messages", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                var mqInst = mqField?.GetValue(pgs);
+                if (mqInst != null)
                 {
-                    int count = 0;
-                    foreach (var msg in msgList)
+                    var msgsField = typeof(XRL.Messages.MessageQueue).GetField("Messages", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    if (msgsField?.GetValue(mqInst) is System.Collections.IList list && list.Count > 0)
                     {
-                        if (count++ >= 20) break;
-                        var text = msg.GetType().GetProperty("Text")?.GetValue(msg) as string;
-                        if (text != null) messages.Add(ConsoleLib.Console.ColorUtility.StripFormatting(text));
+                        int start = Math.Max(0, list.Count - 20);
+                        for (int i = start; i < list.Count; i++)
+                        {
+                            string t = list[i]?.ToString();
+                            if (!string.IsNullOrEmpty(t))
+                                messages.Add(ConsoleLib.Console.ColorUtility.StripFormatting(t));
+                        }
                     }
                 }
             }
@@ -890,13 +1055,23 @@ public class AgentBridgePart : IPart
     static List<Dictionary<string, string>> ReadChoicesFromNode(System.Xml.XmlNode nodeEl)
     {
         var choices = new List<Dictionary<string, string>>();
+        // Get player for variable resolution
+        GameObject contextPlayer = null;
+        try { contextPlayer = XRLCore.Core?.Game?.Player?.Body; } catch { }
+
         int idx = 0;
         foreach (System.Xml.XmlNode choiceEl in nodeEl.SelectNodes("choice"))
         {
+            // Skip choices whose conditions aren't met
+            if (!EvaluateConversationConditions(choiceEl)) continue;
+
             string ct = choiceEl.InnerText?.Trim() ?? "";
             if (string.IsNullOrEmpty(ct)) { var t = choiceEl.SelectSingleNode("text"); ct = t?.InnerText?.Trim() ?? ""; }
             ct = ConsoleLib.Console.ColorUtility.StripFormatting(ct.Split('~')[0].Trim());
-            string tgt = choiceEl.Attributes?["Target"]?.Value ?? "End";
+            ct = ResolveTextVariables(ct, contextPlayer);
+            string tgt = choiceEl.Attributes?["Target"]?.Value
+                      ?? choiceEl.Attributes?["GotoID"]?.Value
+                      ?? "End";
             if (!string.IsNullOrEmpty(ct))
             {
                 choices.Add(new Dictionary<string, string>
@@ -1050,6 +1225,394 @@ public class AgentBridgePart : IPart
     }
 
     /// <summary>
+    /// Process item-related conversation parts (ReceiveItem, TakeItem, GiveArtifact) on an XML element.
+    /// Returns a list of item action descriptions.
+    /// </summary>
+    static List<Dictionary<string, object>> ProcessConversationItemParts(System.Xml.XmlNode xmlElement, GameObject player)
+    {
+        var actions = new List<Dictionary<string, object>>();
+        if (xmlElement == null || player == null) return actions;
+
+        // Process ReceiveItem parts — give items to the player
+        foreach (System.Xml.XmlNode part in xmlElement.SelectNodes("part[@Name='ReceiveItem']"))
+        {
+            try
+            {
+                string blueprints = part.Attributes?["Blueprints"]?.Value;
+                string identify = part.Attributes?["Identify"]?.Value ?? "";
+                if (string.IsNullOrEmpty(blueprints)) continue;
+
+                var received = new List<string>();
+                foreach (string bp in blueprints.Split(','))
+                {
+                    string bpTrimmed = bp.Trim();
+                    if (string.IsNullOrEmpty(bpTrimmed)) continue;
+                    try
+                    {
+                        // Create item from blueprint and add to player inventory
+                        var item = GameObject.create(bpTrimmed);
+                        if (item != null)
+                        {
+                            player.Inventory.AddObject(item);
+                            string itemName = ConsoleLib.Console.ColorUtility.StripFormatting(item.DisplayName ?? bpTrimmed);
+                            received.Add(itemName);
+
+                            // Identify if requested
+                            if (identify == "All" || identify == "*" ||
+                                identify.Split(',').Any(i => i.Trim() == bpTrimmed))
+                            {
+                                try { item.MakeUnderstood(); } catch { }
+                            }
+                        }
+                    }
+                    catch { received.Add(bpTrimmed + " (create failed)"); }
+                }
+                actions.Add(new Dictionary<string, object>
+                {
+                    ["type"] = "receive_item",
+                    ["items"] = received,
+                    ["result"] = received.Count > 0 ? "ok" : "failed"
+                });
+                if (received.Count > 0)
+                {
+                    EmitEvent("item.received", new Dictionary<string, object>
+                    {
+                        ["items"] = received,
+                        ["source"] = "conversation"
+                    });
+                }
+            }
+            catch { }
+        }
+
+        // Process TakeItem parts — remove items from the player
+        foreach (System.Xml.XmlNode part in xmlElement.SelectNodes("part[@Name='TakeItem']"))
+        {
+            try
+            {
+                string blueprints = part.Attributes?["Blueprints"]?.Value;
+                int amount = 1;
+                int.TryParse(part.Attributes?["Amount"]?.Value, out amount);
+                if (amount <= 0) amount = 1;
+                if (string.IsNullOrEmpty(blueprints)) continue;
+
+                var taken = new List<string>();
+                foreach (string bp in blueprints.Split(','))
+                {
+                    string bpTrimmed = bp.Trim();
+                    if (player.Inventory?.Objects == null) break;
+                    int remaining = amount;
+                    foreach (var item in player.Inventory.Objects.ToList())
+                    {
+                        if (remaining <= 0) break;
+                        if (item.Blueprint == bpTrimmed || (item.DisplayName?.Contains(bpTrimmed) == true))
+                        {
+                            string itemName = ConsoleLib.Console.ColorUtility.StripFormatting(item.DisplayName ?? bpTrimmed);
+                            item.Destroy();
+                            taken.Add(itemName);
+                            remaining--;
+                        }
+                    }
+                }
+                actions.Add(new Dictionary<string, object>
+                {
+                    ["type"] = "take_item",
+                    ["items"] = taken,
+                    ["result"] = taken.Count > 0 ? "ok" : "not_found"
+                });
+            }
+            catch { }
+        }
+
+        return actions;
+    }
+
+    /// <summary>
+    /// Check a quest condition via The.Game API. Returns false if the method doesn't exist or throws.
+    /// </summary>
+    static bool CheckQuestCondition(string methodName, params object[] args)
+    {
+        try
+        {
+            var game = The.Game;
+            if (game == null) return false;
+            var m = game.GetType().GetMethod(methodName, BindingFlags.Public | BindingFlags.Instance);
+            if (m != null)
+            {
+                var result = m.Invoke(game, args);
+                return result is bool b && b;
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    /// <summary>
+    /// Evaluate conditional attributes on a conversation XML node (IfHaveQuest, IfNotHaveQuest, etc.).
+    /// Returns true if all conditions are met (or no conditions exist).
+    /// </summary>
+    static bool EvaluateConversationConditions(System.Xml.XmlNode node)
+    {
+        if (node?.Attributes == null) return true;
+
+        string val;
+
+        val = node.Attributes["IfHaveQuest"]?.Value;
+        if (val != null && !CheckQuestCondition("HasQuest", val)) return false;
+
+        val = node.Attributes["IfNotHaveQuest"]?.Value;
+        if (val != null && CheckQuestCondition("HasQuest", val)) return false;
+
+        val = node.Attributes["IfFinishedQuest"]?.Value;
+        if (val != null && !CheckQuestCondition("HasFinishedQuest", val)) return false;
+
+        val = node.Attributes["IfHaveActiveQuest"]?.Value;
+        if (val != null && !CheckQuestCondition("HasActiveQuest", val)) return false;
+
+        val = node.Attributes["IfFinishedQuestStep"]?.Value;
+        if (val != null)
+        {
+            var parts = val.Split('~');
+            if (parts.Length >= 2 && !CheckQuestCondition("FinishedQuestStep", parts[0], parts[1])) return false;
+        }
+
+        val = node.Attributes["IfNotFinishedQuestStep"]?.Value;
+        if (val != null)
+        {
+            var parts = val.Split('~');
+            if (parts.Length >= 2 && CheckQuestCondition("FinishedQuestStep", parts[0], parts[1])) return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Find the best start node in a conversation by evaluating conditions on all start/node elements.
+    /// Returns the first node whose conditions are met, falling back to an unconditional start.
+    /// </summary>
+    static System.Xml.XmlNode FindBestStartNode(System.Xml.XmlNode convNode)
+    {
+        if (convNode == null) return null;
+
+        // Gather all <start> and <node> elements that could serve as entry points
+        // Priority: conditional <start> nodes first (most specific match), then unconditional
+        var startNodes = convNode.SelectNodes("start");
+        var nodeNodes = convNode.SelectNodes("node");
+
+        // First pass: find a conditional start whose conditions are ALL met
+        if (startNodes != null)
+        {
+            foreach (System.Xml.XmlNode s in startNodes)
+            {
+                if (s.Attributes != null && HasAnyCondition(s) && EvaluateConversationConditions(s))
+                    return s;
+            }
+        }
+        // Also check <node> elements with ID="Start*" that have conditions
+        if (nodeNodes != null)
+        {
+            foreach (System.Xml.XmlNode n in nodeNodes)
+            {
+                string id = n.Attributes?["ID"]?.Value ?? "";
+                if (id.StartsWith("Start") && HasAnyCondition(n) && EvaluateConversationConditions(n))
+                    return n;
+            }
+        }
+
+        // Second pass: unconditional start node (no quest conditions)
+        if (startNodes != null)
+        {
+            foreach (System.Xml.XmlNode s in startNodes)
+            {
+                if (!HasAnyCondition(s)) return s;
+            }
+        }
+
+        // Final fallback: first start or node[@ID='Start']
+        return convNode.SelectSingleNode("start") ?? convNode.SelectSingleNode("node[@ID='Start']");
+    }
+
+    static bool HasAnyCondition(System.Xml.XmlNode node)
+    {
+        if (node?.Attributes == null) return false;
+        return node.Attributes["IfHaveQuest"] != null
+            || node.Attributes["IfNotHaveQuest"] != null
+            || node.Attributes["IfFinishedQuest"] != null
+            || node.Attributes["IfHaveActiveQuest"] != null
+            || node.Attributes["IfFinishedQuestStep"] != null
+            || node.Attributes["IfNotFinishedQuestStep"] != null;
+    }
+
+    /// <summary>
+    /// Process quest-related ATTRIBUTES on a choice or node element (StartQuest, CompleteQuestStep, FinishQuest).
+    /// These are separate from QuestHandler parts — they're the primary quest trigger mechanism.
+    /// </summary>
+    static List<Dictionary<string, object>> ProcessChoiceQuestAttributes(System.Xml.XmlNode element)
+    {
+        var actions = new List<Dictionary<string, object>>();
+        if (element?.Attributes == null) return actions;
+
+        var game = The.Game;
+        if (game == null) return actions;
+
+        // StartQuest attribute
+        string startQuest = element.Attributes["StartQuest"]?.Value;
+        if (startQuest != null)
+        {
+            try
+            {
+                // StartQuest(String, String, String, String) — questId, speaker, ?, ?
+                // Try the 4-param string version first, fall back to 2-param
+                bool called = false;
+                try
+                {
+                    var m4 = game.GetType().GetMethod("StartQuest",
+                        new[] { typeof(string), typeof(string), typeof(string), typeof(string) });
+                    if (m4 != null)
+                    {
+                        m4.Invoke(game, new object[] { startQuest, _lastSpeakerName ?? "", null, null });
+                        called = true;
+                    }
+                }
+                catch { }
+                if (!called)
+                {
+                    // Try 2-param version as fallback
+                    try { game.StartQuest(startQuest, _lastSpeakerName); called = true; } catch { }
+                }
+                actions.Add(new Dictionary<string, object>
+                {
+                    ["questId"] = startQuest, ["action"] = "start", ["result"] = called ? "started" : "no_method"
+                });
+                if (called)
+                {
+                    EmitEvent("quest.started", new Dictionary<string, object>
+                    {
+                        ["questId"] = startQuest, ["speaker"] = _lastSpeakerName ?? "", ["source"] = "choice_attribute"
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                actions.Add(new Dictionary<string, object>
+                {
+                    ["questId"] = startQuest, ["action"] = "start", ["result"] = "error", ["error"] = ex.Message
+                });
+            }
+        }
+
+        // CompleteQuestStep attribute (format: "QuestID~StepID")
+        string completeStep = element.Attributes["CompleteQuestStep"]?.Value;
+        if (completeStep != null)
+        {
+            var parts = completeStep.Split('~');
+            if (parts.Length >= 2)
+            {
+                try
+                {
+                    // FinishQuestStep(String, String, Int32, Boolean, String) — 5 params
+                    bool called = false;
+                    try
+                    {
+                        var m = game.GetType().GetMethod("FinishQuestStep",
+                            new[] { typeof(string), typeof(string), typeof(int), typeof(bool), typeof(string) });
+                        if (m != null) { m.Invoke(game, new object[] { parts[0], parts[1], 0, false, null }); called = true; }
+                    }
+                    catch { }
+                    if (!called) { try { game.FinishQuestStep(parts[0], parts[1]); called = true; } catch { } }
+
+                    actions.Add(new Dictionary<string, object>
+                    {
+                        ["questId"] = parts[0], ["stepId"] = parts[1], ["action"] = "step", ["result"] = called ? "step_completed" : "no_method"
+                    });
+                    if (called) EmitEvent("quest.step", new Dictionary<string, object>
+                    {
+                        ["questId"] = parts[0], ["stepId"] = parts[1], ["source"] = "choice_attribute"
+                    });
+                }
+                catch (Exception ex)
+                {
+                    actions.Add(new Dictionary<string, object>
+                    {
+                        ["questId"] = parts[0], ["action"] = "step", ["result"] = "error", ["error"] = ex.Message
+                    });
+                }
+            }
+        }
+
+        // FinishQuest attribute
+        string finishQuest = element.Attributes["FinishQuest"]?.Value;
+        if (finishQuest != null)
+        {
+            try
+            {
+                game.FinishQuest(finishQuest);
+                actions.Add(new Dictionary<string, object>
+                {
+                    ["questId"] = finishQuest, ["action"] = "finish", ["result"] = "finished"
+                });
+                EmitEvent("quest.finished", new Dictionary<string, object>
+                {
+                    ["questId"] = finishQuest, ["source"] = "choice_attribute"
+                });
+            }
+            catch (Exception ex)
+            {
+                actions.Add(new Dictionary<string, object>
+                {
+                    ["questId"] = finishQuest, ["action"] = "finish", ["result"] = "error", ["error"] = ex.Message
+                });
+            }
+        }
+
+        return actions;
+    }
+
+    /// <summary>
+    /// Resolve =variable= template macros in conversation text using GameText.VariableReplace.
+    /// Falls back to raw text if the API isn't available.
+    /// </summary>
+    static string ResolveTextVariables(string text, GameObject contextObject = null)
+    {
+        if (string.IsNullOrEmpty(text) || !text.Contains("=")) return text;
+        try
+        {
+            var gameTextType = typeof(XRL.Core.XRLCore).Assembly.GetType("XRL.GameText");
+            if (gameTextType != null)
+            {
+                // Try the full signature: VariableReplace(string, string, bool, string, bool, bool)
+                var methods = gameTextType.GetMethods(BindingFlags.Public | BindingFlags.Static);
+                System.Reflection.MethodInfo varReplace = null;
+                foreach (var m in methods)
+                {
+                    if (m.Name == "VariableReplace" && m.GetParameters().Length >= 2)
+                    {
+                        varReplace = m;
+                        break;
+                    }
+                }
+                if (varReplace != null)
+                {
+                    var parms = varReplace.GetParameters();
+                    // Build args array matching the parameter count
+                    object[] args;
+                    if (parms.Length >= 6)
+                        args = new object[] { text, contextObject?.id, false, null, false, true };
+                    else if (parms.Length >= 2)
+                        args = new object[] { text, contextObject?.id };
+                    else
+                        args = new object[] { text };
+
+                    var result = varReplace.Invoke(null, args) as string;
+                    if (result != null) return result;
+                }
+            }
+        }
+        catch { }
+        return text;
+    }
+
+    /// <summary>
     /// Execute a command from the agent.
     /// </summary>
     public static Dictionary<string, object> ExecuteCommand(GameObject player, string command)
@@ -1130,17 +1693,93 @@ public class AgentBridgePart : IPart
             }
             if (target != null)
             {
-                player.Target = target;
-                result["status"] = "ok";
-                result["target"] = ConsoleLib.Console.ColorUtility.StripFormatting(target.DisplayName);
+                string targetName = ConsoleLib.Console.ColorUtility.StripFormatting(target.DisplayName);
+                result["target"] = targetName;
                 result["distance"] = bestDist;
 
-                // Emit combat.attack event (Change 2)
+                if (bestDist <= 1 && target.CurrentCell != null && player.CurrentCell != null)
+                {
+                    // Adjacent — calculate direction and fire directional attack
+                    int dx = target.CurrentCell.X - player.CurrentCell.X;
+                    int dy = target.CurrentCell.Y - player.CurrentCell.Y;
+                    string dir = "";
+                    if (dy < 0) dir += "N";
+                    else if (dy > 0) dir += "S";
+                    if (dx > 0) dir += "E";
+                    else if (dx < 0) dir += "W";
+                    if (string.IsNullOrEmpty(dir)) dir = "N"; // same cell fallback
+
+                    // Set target and fire the directional attack command
+                    player.Target = target;
+                    try
+                    {
+                        // CmdAttackDirection fires the full melee attack chain
+                        var attackEvent = XRL.World.Event.New("CommandAttackDirection", "Direction", dir);
+                        player.FireEvent(attackEvent);
+                        player.UseEnergy(1000);
+                        result["status"] = "ok";
+                        result["attacked"] = true;
+                        result["direction"] = dir;
+                    }
+                    catch
+                    {
+                        // Fallback: move into the target (triggers melee automatically)
+                        bool moved = player.Move(dir, Forced: false);
+                        player.UseEnergy(1000);
+                        result["status"] = "ok";
+                        result["attacked"] = moved;
+                        result["direction"] = dir;
+                        result["method"] = "move_into";
+                    }
+                }
+                else if (bestDist > 1)
+                {
+                    // Not adjacent — pathfind to target first, then attack
+                    player.Target = target;
+                    var path = FindPath(player.CurrentCell.ParentZone,
+                        player.CurrentCell.X, player.CurrentCell.Y,
+                        target.CurrentCell.X, target.CurrentCell.Y, player, 80);
+                    if (path != null && path.Count > 1)
+                    {
+                        // Walk toward target (stop 1 tile away)
+                        int stepsToTake = Math.Min(path.Count - 1, 79);
+                        int stepsTaken = 0;
+                        for (int i = 0; i < stepsToTake; i++)
+                        {
+                            bool moved = player.Move(path[i], Forced: false);
+                            if (!moved) break;
+                            player.UseEnergy(1000);
+                            stepsTaken++;
+                        }
+                        // If now adjacent, swing
+                        if (player.DistanceTo(target) <= 1 && target.CurrentCell != null)
+                        {
+                            int dx2 = target.CurrentCell.X - player.CurrentCell.X;
+                            int dy2 = target.CurrentCell.Y - player.CurrentCell.Y;
+                            string dir2 = "";
+                            if (dy2 < 0) dir2 += "N"; else if (dy2 > 0) dir2 += "S";
+                            if (dx2 > 0) dir2 += "E"; else if (dx2 < 0) dir2 += "W";
+                            if (string.IsNullOrEmpty(dir2)) dir2 = "N";
+                            player.Move(dir2, Forced: false);
+                            player.UseEnergy(1000);
+                            result["attacked"] = true;
+                        }
+                        result["status"] = "ok";
+                        result["steps"] = stepsTaken;
+                    }
+                    else
+                    {
+                        result["status"] = "error";
+                        result["message"] = "Cannot path to " + targetName;
+                    }
+                }
+
                 EmitEvent("combat.attack", new Dictionary<string, object>
                 {
-                    ["target"] = ConsoleLib.Console.ColorUtility.StripFormatting(target.DisplayName),
+                    ["target"] = targetName,
                     ["targetId"] = target.id ?? target.GetHashCode().ToString(),
-                    ["distance"] = bestDist
+                    ["distance"] = bestDist,
+                    ["attacked"] = result.ContainsKey("attacked") && (bool)result["attacked"]
                 });
             }
             else
@@ -1287,12 +1926,25 @@ public class AgentBridgePart : IPart
                             var convNode = doc.SelectSingleNode($"//conversation[@ID='{convId}']");
                             if (convNode != null)
                             {
-                                var startEl = convNode.SelectSingleNode("start") ?? convNode.SelectSingleNode("node[@ID='Start']");
+                                var startEl = FindBestStartNode(convNode);
                                 if (startEl != null)
                                 {
                                     var textEl = startEl.SelectSingleNode("text");
-                                    result["npcText"] = ConsoleLib.Console.ColorUtility.StripFormatting(
-                                        (textEl?.InnerText?.Trim() ?? "").Split('~')[0].Trim());
+                                    // Find the best text element (check conditions on <text> too)
+                                    string rawText = "";
+                                    var textNodes = startEl.SelectNodes("text");
+                                    if (textNodes != null && textNodes.Count > 1)
+                                    {
+                                        foreach (System.Xml.XmlNode tn in textNodes)
+                                        {
+                                            if (EvaluateConversationConditions(tn)) { rawText = tn.InnerText?.Trim() ?? ""; break; }
+                                        }
+                                        if (string.IsNullOrEmpty(rawText)) rawText = textEl?.InnerText?.Trim() ?? "";
+                                    }
+                                    else rawText = textEl?.InnerText?.Trim() ?? "";
+
+                                    rawText = ConsoleLib.Console.ColorUtility.StripFormatting(rawText.Split('~')[0].Trim());
+                                    result["npcText"] = ResolveTextVariables(rawText, player);
                                     result["choices"] = ReadChoicesFromNode(startEl);
                                     _currentConvXml = convNode;
                                     _currentNodeId = startEl.Attributes?["ID"]?.Value ?? "Start";
@@ -1509,7 +2161,7 @@ public class AgentBridgePart : IPart
                 {
                     try
                     {
-                        // Read raw conversation XML as fallback
+                        // Read conversation XML with conditional node selection
                         string convXmlPath = System.IO.Path.Combine(
                             UE.Application.streamingAssetsPath, "Base", "Conversations.xml");
                         if (File.Exists(convXmlPath))
@@ -1519,45 +2171,25 @@ public class AgentBridgePart : IPart
                             var convNode = doc.SelectSingleNode($"//conversation[@ID='{convId}']");
                             if (convNode != null)
                             {
-                                // Find start node (first <start> or <node> with ID="Start")
-                                var startEl = convNode.SelectSingleNode("start") ?? convNode.SelectSingleNode("node[@ID='Start']");
+                                var startEl = FindBestStartNode(convNode);
                                 if (startEl != null)
                                 {
-                                    // Get NPC text
-                                    var textEl = startEl.SelectSingleNode("text");
-                                    string npcText = textEl?.InnerText?.Trim() ?? "";
-                                    npcText = ConsoleLib.Console.ColorUtility.StripFormatting(npcText);
-                                    // Clean up tildes (alternate text separator)
-                                    npcText = npcText.Split('~')[0].Trim();
-                                    result["npcText"] = npcText;
-
-                                    // Get choices
-                                    var choices = new List<Dictionary<string, string>>();
-                                    int idx = 0;
-                                    foreach (System.Xml.XmlNode choiceEl in startEl.SelectNodes("choice"))
+                                    // Get NPC text (evaluate conditions on <text> elements too)
+                                    string npcText = "";
+                                    var textNodes = startEl.SelectNodes("text");
+                                    if (textNodes != null && textNodes.Count > 1)
                                     {
-                                        string choiceText = choiceEl.InnerText?.Trim() ?? "";
-                                        if (string.IsNullOrEmpty(choiceText))
+                                        foreach (System.Xml.XmlNode tn in textNodes)
                                         {
-                                            var ct = choiceEl.SelectSingleNode("text");
-                                            choiceText = ct?.InnerText?.Trim() ?? "";
+                                            if (EvaluateConversationConditions(tn)) { npcText = tn.InnerText?.Trim() ?? ""; break; }
                                         }
-                                        choiceText = ConsoleLib.Console.ColorUtility.StripFormatting(choiceText);
-                                        choiceText = choiceText.Split('~')[0].Trim();
-                                        string target = choiceEl.Attributes?["Target"]?.Value ?? "End";
-
-                                        if (!string.IsNullOrEmpty(choiceText))
-                                        {
-                                            choices.Add(new Dictionary<string, string>
-                                            {
-                                                ["index"] = idx.ToString(),
-                                                ["text"] = choiceText,
-                                                ["target"] = target,
-                                            });
-                                            idx++;
-                                        }
+                                        if (string.IsNullOrEmpty(npcText)) npcText = startEl.SelectSingleNode("text")?.InnerText?.Trim() ?? "";
                                     }
-                                    result["choices"] = choices;
+                                    else npcText = startEl.SelectSingleNode("text")?.InnerText?.Trim() ?? "";
+
+                                    npcText = ConsoleLib.Console.ColorUtility.StripFormatting(npcText.Split('~')[0].Trim());
+                                    result["npcText"] = ResolveTextVariables(npcText, player);
+                                    result["choices"] = ReadChoicesFromNode(startEl);
                                     _currentConvXml = convNode;
                                     _currentNodeId = startEl.Attributes?["ID"]?.Value ?? "Start";
                                 }
@@ -1591,25 +2223,36 @@ public class AgentBridgePart : IPart
 
                     if (nodeEl != null)
                     {
-                        var choiceNodes = nodeEl.SelectNodes("choice");
-                        if (choiceIdx >= 0 && choiceIdx < choiceNodes.Count)
+                        // Filter choices by conditions (IfHaveQuest etc.) to match what ReadChoicesFromNode showed
+                        var allChoiceNodes = nodeEl.SelectNodes("choice");
+                        var validChoices = new List<System.Xml.XmlNode>();
+                        foreach (System.Xml.XmlNode c in allChoiceNodes)
                         {
-                            var chosen = choiceNodes[choiceIdx];
+                            if (EvaluateConversationConditions(c)) validChoices.Add(c);
+                        }
+
+                        if (choiceIdx >= 0 && choiceIdx < validChoices.Count)
+                        {
+                            var chosen = validChoices[choiceIdx];
                             string choiceText = chosen.InnerText?.Trim() ?? "";
                             if (string.IsNullOrEmpty(choiceText)) { var t = chosen.SelectSingleNode("text"); choiceText = t?.InnerText?.Trim() ?? ""; }
                             choiceText = ConsoleLib.Console.ColorUtility.StripFormatting(choiceText.Split('~')[0].Trim());
                             result["status"] = "ok";
-                            result["chose"] = choiceText;
+                            result["chose"] = ResolveTextVariables(choiceText, player);
 
-                            string targetId = chosen.Attributes?["Target"]?.Value ?? "End";
+                            string targetId = chosen.Attributes?["Target"]?.Value
+                                           ?? chosen.Attributes?["GotoID"]?.Value
+                                           ?? "End";
                             result["targetNode"] = targetId;
 
-                            // Process QuestHandler parts on the CHOICE element itself
+                            // Process quest triggers AND item parts on the choice
                             var questActions = new List<Dictionary<string, object>>();
+                            var itemActions = new List<Dictionary<string, object>>();
                             try
                             {
-                                var choiceQuestActions = ProcessQuestHandlers(chosen);
-                                questActions.AddRange(choiceQuestActions);
+                                questActions.AddRange(ProcessQuestHandlers(chosen));
+                                questActions.AddRange(ProcessChoiceQuestAttributes(chosen));
+                                itemActions.AddRange(ProcessConversationItemParts(chosen, player));
                             }
                             catch { }
 
@@ -1622,10 +2265,20 @@ public class AgentBridgePart : IPart
                                 if (nextNodeEl != null)
                                 {
                                     _currentNodeId = targetId;
-                                    var textEl = nextNodeEl.SelectSingleNode("text");
-                                    string npcText = textEl?.InnerText?.Trim() ?? "";
+                                    // Get NPC text with condition evaluation and variable resolution
+                                    string npcText = "";
+                                    var textNodes = nextNodeEl.SelectNodes("text");
+                                    if (textNodes != null && textNodes.Count > 1)
+                                    {
+                                        foreach (System.Xml.XmlNode tn in textNodes)
+                                        {
+                                            if (EvaluateConversationConditions(tn)) { npcText = tn.InnerText?.Trim() ?? ""; break; }
+                                        }
+                                        if (string.IsNullOrEmpty(npcText)) npcText = nextNodeEl.SelectSingleNode("text")?.InnerText?.Trim() ?? "";
+                                    }
+                                    else npcText = nextNodeEl.SelectSingleNode("text")?.InnerText?.Trim() ?? "";
                                     npcText = ConsoleLib.Console.ColorUtility.StripFormatting(npcText.Split('~')[0].Trim());
-                                    result["npcText"] = npcText;
+                                    result["npcText"] = ResolveTextVariables(npcText, player);
 
                                     // Collect choices from this node
                                     var nextChoices = ReadChoicesFromNode(nextNodeEl);
@@ -1638,11 +2291,12 @@ public class AgentBridgePart : IPart
                                         _currentNodeId = null;
                                     }
 
-                                    // Process QuestHandler parts on the TARGET NODE
+                                    // Process QuestHandler parts, quest attributes, AND item parts on the TARGET NODE
                                     try
                                     {
-                                        var nodeQuestActions = ProcessQuestHandlers(nextNodeEl);
-                                        questActions.AddRange(nodeQuestActions);
+                                        questActions.AddRange(ProcessQuestHandlers(nextNodeEl));
+                                        questActions.AddRange(ProcessChoiceQuestAttributes(nextNodeEl));
+                                        itemActions.AddRange(ProcessConversationItemParts(nextNodeEl, player));
                                     }
                                     catch { }
                                 }
@@ -1660,8 +2314,10 @@ public class AgentBridgePart : IPart
 
                             if (questActions.Count > 0)
                                 result["questActions"] = questActions;
+                            if (itemActions.Count > 0)
+                                result["itemActions"] = itemActions;
                         }
-                        else { result["status"] = "error"; result["message"] = $"Invalid choice {choiceIdx} (have {choiceNodes.Count} choices)"; }
+                        else { result["status"] = "error"; result["message"] = $"Invalid choice {choiceIdx} (have {validChoices.Count} valid choices)"; }
                     }
                     else { result["status"] = "error"; result["message"] = "Current node '" + _currentNodeId + "' not found"; _currentConvXml = null; _currentNodeId = null; }
                 }
@@ -2214,6 +2870,7 @@ public class AgentBridgePart : IPart
                 return "move " + direction;
             }
             case "movement.path_to":
+            case "movement.navigate":
             {
                 if (action.ContainsKey("target"))
                     return "navigate " + action["target"]?.ToString();
@@ -2222,21 +2879,24 @@ public class AgentBridgePart : IPart
                 return null;
             }
             case "interaction.talk":
+            case "interact.talk":
             {
                 string target = action.ContainsKey("target") ? action["target"]?.ToString() ?? "" : "";
                 return "talkto " + target;
             }
             case "interaction.choose_dialogue":
+            case "interact.choose_dialogue":
             {
                 string choice = action.ContainsKey("choice") ? action["choice"]?.ToString() ?? "0" : "0";
                 return "choose " + choice;
             }
             case "combat.melee":
+            case "combat.attack":
             {
-                if (action.ContainsKey("direction"))
-                    return "move " + action["direction"]?.ToString();
                 if (action.ContainsKey("target"))
-                    return "navigate " + action["target"]?.ToString();
+                    return "attack " + action["target"]?.ToString();
+                if (action.ContainsKey("direction"))
+                    return "attack " + action["direction"]?.ToString();
                 return null;
             }
             case "inventory.consume_food":
@@ -2259,10 +2919,15 @@ public class AgentBridgePart : IPart
                 return "examine " + target;
             }
             case "interact.trade":
+            case "interaction.trade":
             {
                 string target = action.ContainsKey("target") ? action["target"]?.ToString() ?? "" : "";
                 return "trade " + target;
             }
+            case "observe.status":
+                return "status";
+            case "observe.look":
+                return "look";
             case "ability.activate":
             {
                 string ability = action.ContainsKey("ability") ? action["ability"]?.ToString() ?? "" : "";
@@ -2469,6 +3134,126 @@ public class AgentBridgePart : IPart
     }
 
     /// <summary>
+    /// Evaluate postconditions by comparing pre-state and post-state.
+    /// Supports delta conditions (changed, unchanged, increased, decreased)
+    /// and static conditions (equals, greaterThan, lessThan, contains, notEmpty).
+    /// Used by perform_action to verify an action achieved its intended effect.
+    /// </summary>
+    static List<Dictionary<string, object>> EvaluatePostconditions(
+        Dictionary<string, object> preState,
+        Dictionary<string, object> postState,
+        List<Dictionary<string, object>> postconditions)
+    {
+        var results = new List<Dictionary<string, object>>();
+        if (postconditions == null) return results;
+
+        foreach (var pc in postconditions)
+        {
+            var result = new Dictionary<string, object>();
+            string pcPath = pc.ContainsKey("path") ? pc["path"]?.ToString() ?? "" : "";
+            string condition = pc.ContainsKey("condition") ? pc["condition"]?.ToString() ?? "" : "";
+            result["path"] = pcPath;
+            result["condition"] = condition;
+
+            object preValue = ResolveStatePath(preState, pcPath);
+            object postValue = ResolveStatePath(postState, pcPath);
+            result["priorValue"] = preValue ?? "(null)";
+            result["currentValue"] = postValue ?? "(null)";
+
+            bool passed = false;
+
+            try
+            {
+                switch (condition)
+                {
+                    // Delta conditions — compare pre vs post
+                    case "changed":
+                        passed = !string.Equals(preValue?.ToString(), postValue?.ToString());
+                        break;
+                    case "unchanged":
+                        passed = string.Equals(preValue?.ToString(), postValue?.ToString());
+                        break;
+                    case "increased":
+                        passed = PostconditionToDouble(postValue) > PostconditionToDouble(preValue);
+                        break;
+                    case "decreased":
+                        passed = PostconditionToDouble(postValue) < PostconditionToDouble(preValue);
+                        break;
+
+                    // Static conditions — evaluate against post-state only
+                    case "equals":
+                    {
+                        object expected = pc.ContainsKey("expected") ? pc["expected"] : null;
+                        result["expected"] = expected;
+                        if (postValue == null)
+                            passed = expected == null;
+                        else if (expected is bool eb)
+                            passed = (postValue is bool pb && pb == eb)
+                                  || postValue.ToString().Equals(eb.ToString(), StringComparison.OrdinalIgnoreCase);
+                        else if (expected is long el)
+                            passed = Convert.ToInt64(postValue) == el;
+                        else if (expected is double ed)
+                            passed = Math.Abs(Convert.ToDouble(postValue) - ed) < 0.001;
+                        else
+                            passed = postValue.ToString().Equals(expected?.ToString() ?? "", StringComparison.OrdinalIgnoreCase);
+                        break;
+                    }
+                    case "greaterThan":
+                    {
+                        double threshold = Convert.ToDouble(pc.ContainsKey("expected") ? pc["expected"] : 0);
+                        result["expected"] = threshold;
+                        passed = Convert.ToDouble(postValue) > threshold;
+                        break;
+                    }
+                    case "lessThan":
+                    {
+                        double threshold = Convert.ToDouble(pc.ContainsKey("expected") ? pc["expected"] : 0);
+                        result["expected"] = threshold;
+                        passed = Convert.ToDouble(postValue) < threshold;
+                        break;
+                    }
+                    case "contains":
+                    {
+                        string needle = pc.ContainsKey("expected") ? pc["expected"]?.ToString() ?? "" : "";
+                        result["expected"] = needle;
+                        passed = postValue?.ToString()?.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
+                        break;
+                    }
+                    case "notEmpty":
+                    {
+                        if (postValue is System.Collections.IList pcList)
+                            passed = pcList.Count > 0;
+                        else if (postValue is string s)
+                            passed = !string.IsNullOrEmpty(s);
+                        else
+                            passed = postValue != null;
+                        break;
+                    }
+                    default:
+                        result["error"] = "Unknown postcondition: " + condition;
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                result["error"] = ex.Message;
+            }
+
+            result["passed"] = passed;
+            results.Add(result);
+        }
+
+        return results;
+    }
+
+    static double PostconditionToDouble(object val)
+    {
+        if (val == null) return 0;
+        if (double.TryParse(val.ToString(), out double d)) return d;
+        return 0;
+    }
+
+    /// <summary>
     /// Process a typed request (request.json) and write response.json.
     /// This is the entry point for the typed harness protocol.
     /// </summary>
@@ -2551,6 +3336,33 @@ public class AgentBridgePart : IPart
                         break;
                     }
 
+                    // Extract postconditions from request (optional)
+                    List<Dictionary<string, object>> postconditions = null;
+                    Dictionary<string, object> preState = null;
+
+                    object pcObj = innerRequest.ContainsKey("postconditions") ? innerRequest["postconditions"] : null;
+                    if (pcObj is Newtonsoft.Json.Linq.JArray pcArr)
+                    {
+                        postconditions = new List<Dictionary<string, object>>();
+                        foreach (var item in pcArr)
+                        {
+                            if (item is Newtonsoft.Json.Linq.JObject pcJo)
+                                postconditions.Add(pcJo.ToObject<Dictionary<string, object>>());
+                        }
+                        if (postconditions.Count > 0)
+                        {
+                            // Capture pre-state snapshot for delta comparisons
+                            WriteStateStatic(player);
+                            try
+                            {
+                                string preJson = File.ReadAllText(StatePath);
+                                preState = DeepConvertJObjects(
+                                    JsonConvert.DeserializeObject<Dictionary<string, object>>(preJson));
+                            }
+                            catch { }
+                        }
+                    }
+
                     string cmdString = TranslateTypedAction(actionDict);
                     if (cmdString == null)
                     {
@@ -2576,6 +3388,47 @@ public class AgentBridgePart : IPart
                     if (cmdResult.ContainsKey("questActions")) effectsList.Add("quest_updated");
                     if (cmdResult.ContainsKey("target") && (cmdString.StartsWith("navigate") || cmdString.StartsWith("attack")))
                         effectsList.Add("navigation_completed");
+
+                    // Evaluate postconditions if provided
+                    if (postconditions != null && postconditions.Count > 0)
+                    {
+                        // Capture post-state for comparison
+                        WriteStateStatic(player);
+                        Dictionary<string, object> postState = null;
+                        try
+                        {
+                            string postJson = File.ReadAllText(StatePath);
+                            postState = DeepConvertJObjects(
+                                JsonConvert.DeserializeObject<Dictionary<string, object>>(postJson));
+                        }
+                        catch { }
+
+                        if (preState != null && postState != null)
+                        {
+                            var pcResults = EvaluatePostconditions(preState, postState, postconditions);
+                            bool allMet = true;
+                            foreach (var r in pcResults)
+                            {
+                                if (r.ContainsKey("passed") && r["passed"] is bool pVal && !pVal)
+                                { allMet = false; break; }
+                            }
+                            response["postconditions"] = new Dictionary<string, object>
+                            {
+                                ["evaluated"] = true,
+                                ["allMet"] = allMet,
+                                ["results"] = pcResults
+                            };
+                        }
+                        else
+                        {
+                            response["postconditions"] = new Dictionary<string, object>
+                            {
+                                ["evaluated"] = false,
+                                ["error"] = "Could not capture state for postcondition evaluation"
+                            };
+                        }
+                    }
+
                     break;
                 }
 

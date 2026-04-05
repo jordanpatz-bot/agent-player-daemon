@@ -10,6 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const { HarnessClient } = require('./harness-client');
+const { createProvider } = require('./llm-provider');
 
 // --- Config ---
 const IPC_DIR = path.join(__dirname, 'mud-daemon', 'data', 'qud', 'ipc');
@@ -20,11 +21,24 @@ const args = process.argv.slice(2);
 const MAX_TURNS = parseInt(args.find((_, i, a) => a[i-1] === '--turns') || '50');
 const ESCALATION_MODEL = args.find((_, i, a) => a[i-1] === '--model') || 'sonnet';
 const BASE_MODEL = 'haiku';
+const LLM_PROVIDER = args.find((_, i, a) => a[i-1] === '--provider') || 'claude';
+const OLLAMA_MODEL = args.find((_, i, a) => a[i-1] === '--ollama-model') || 'gemma4';
+const OLLAMA_ENDPOINT = args.find((_, i, a) => a[i-1] === '--ollama-endpoint') || 'http://localhost:11434';
+const VISION_MODE = args.includes('--vision');
+
+const llm = createProvider({
+  provider: LLM_PROVIDER,
+  ollamaModel: OLLAMA_MODEL,
+  ollamaEndpoint: OLLAMA_ENDPOINT,
+});
 
 fs.mkdirSync(REPORT_DIR, { recursive: true });
 
 // --- Harness client (typed protocol with legacy fallback) ---
-const harness = new HarnessClient(IPC_DIR);
+const harness = new HarnessClient(IPC_DIR, { visionMode: VISION_MODE });
+if (VISION_MODE) {
+  console.log('[AGENT] VISION MODE: reading perception from vision-state.json');
+}
 
 /**
  * Execute a single game command. Accepts either:
@@ -35,16 +49,46 @@ const harness = new HarnessClient(IPC_DIR);
  * @returns {Promise<object>}
  */
 async function executeStep(cmd, timeoutMs = 15000) {
+  // Snapshot position before movement so we can detect wall-bonking client-side
+  const isMove = (typeof cmd === 'object' && cmd.type === 'movement.step') ||
+                 (typeof cmd === 'string' && cmd.startsWith('move '));
+  let preMovePos = null;
+  if (isMove) {
+    const preState = harness.readState();
+    if (preState?.position) preMovePos = { x: preState.position.x, y: preState.position.y };
+  }
+
   let result;
   if (typeof cmd === 'object' && cmd.type) {
     // Typed action — use harness performAction (tries typed protocol, falls back to legacy)
-    result = await harness.performAction(cmd, { timeout: timeoutMs });
+    const opts = { timeout: timeoutMs };
+
+    // Include postconditions for typed protocol (works when bridge supports it)
+    if (isMove && cmd.direction) {
+      const axis = ['n', 's'].includes(cmd.direction[0]) ? 'position.y'
+                 : ['e', 'w'].includes(cmd.direction[0]) ? 'position.x'
+                 : 'position.x'; // diagonal — check x as proxy
+      opts.postconditions = [{ path: axis, condition: 'changed' }];
+    }
+
+    result = await harness.performAction(cmd, opts);
   } else {
     // Raw string command — use legacy command.txt path directly
     result = await harness.sendLegacyCommand(String(cmd), timeoutMs);
   }
   // Brief pause for game to settle
   await sleep(500);
+
+  // Client-side wall detection: compare position before/after move
+  if (isMove && preMovePos) {
+    const postState = harness.readState();
+    if (postState?.position &&
+        postState.position.x === preMovePos.x &&
+        postState.position.y === preMovePos.y) {
+      result._moveBlocked = true;
+    }
+  }
+
   return result;
 }
 
@@ -57,16 +101,25 @@ async function executePlan(steps) {
     log('CMD', cmd);
     const result = await executeStep(cmd, step.timeout || 15000);
 
+    const blocked = result._moveBlocked === true;
     const failed = result.status === 'error' || result.status === 'timeout';
     let summary = '';
-    if (result.npcText) summary = result.npcText.slice(0, 120);
+    if (blocked) summary = 'BLOCKED (wall/obstacle)';
+    else if (result.npcText) summary = result.npcText.slice(0, 120);
     else if (result.message) summary = result.message;
     else if (result.status) summary = result.status;
     if (result.steps) summary += ` (${result.steps} steps)`;
     if (result.arrived !== undefined) summary += result.arrived ? ' [arrived]' : ' [not arrived]';
 
-    log(failed ? 'FAIL' : ' OK ', summary.slice(0, 100));
-    results.push({ command: cmd, result, failed, summary: summary.slice(0, 200) });
+    log(failed ? 'FAIL' : blocked ? 'WALL' : ' OK ', summary.slice(0, 100));
+    results.push({ command: cmd, result, failed, blocked, summary: summary.slice(0, 200) });
+
+    // Abort remaining move chain if we hit a wall — no point bonking repeatedly
+    if (blocked) {
+      const remaining = steps.length - results.length;
+      if (remaining > 0) log('WALL', `Aborting ${remaining} remaining steps — obstacle in the way`);
+      break;
+    }
 
     if (result.choices) {
       const choiceList = result.choices.map(c => `  ${c.index}: "${c.text}" → ${c.target}`).join('\n');
@@ -526,7 +579,7 @@ function summarizeState(state) {
     `${e.name}@(${e.x},${e.y})${e.hostile ? ' HOSTILE' : ''} ${e.hp}/${e.maxHp}hp`
   ).join('; ');
 
-  const inv = (state.inventory || []).join('; ');
+  const inv = (state.inventory || []).map(i => typeof i === 'string' ? i : (i.name || JSON.stringify(i))).join('; ');
   const equip = Object.entries(state.equipment || {}).map(([k,v]) => `${k}:${v}`).join('; ');
   const quests = (state.quests || []).map(q => q.name || q).join('; ');
 
@@ -584,7 +637,10 @@ QUESTS: ${quests || 'none tracked by game'}
 ${interactionStr}
 HOSTILE ENTITIES: ${hostileStr}
 ADJACENT: ${adj || 'nobody adjacent'}
-NEARBY NPCS: ${friendlyStr || 'none'}${eventsStr ? '\n' + eventsStr : ''}${summarizeKnownLocations(state)}`;
+NEARBY NPCS: ${friendlyStr || 'none'}${eventsStr ? '\n' + eventsStr : ''}${(() => {
+  const msgs = (state.messages || []);
+  return msgs.length > 0 ? '\nMESSAGES: ' + msgs.slice(-10).join(' | ') : '';
+})()}${summarizeKnownLocations(state)}`;
 }
 
 function summarizeKnownLocations(state) {
@@ -626,10 +682,16 @@ CRITICAL RULES FOR CONVERSATIONS:
 6. Quest tracking: The game's quest log doesn't update from conversations. Track quests yourself based on NPC text.
 
 NAVIGATION:
-- North=Y decreases, South=Y increases, East=X increases, West=X decreases. Diagonals work.
-- When navigate fails: calculate direction manually and use 'move' commands.
+- ALWAYS use 'navigate <name>' or 'navigate <x> <y>' to move more than 2 tiles. It has A* pathfinding and routes around walls.
+- NEVER plan long sequences of 'move' commands. They WILL hit walls and fail. Use navigate instead.
+- 'move <dir>' is ONLY for fine adjustments (1-2 tiles) or when navigate explicitly fails.
+- North=Y decreases, South=Y increases, East=X increases, West=X decreases.
 - Zone edges: moving off-screen (x<0 or x>79 or y<0 or y>24) transitions to adjacent zone.
-- To find caves: explore zone edges, go underground via staircases (> symbol), check entity list for cave entrances.
+- To reach an NPC: use 'navigate <name>' then 'talkto <name>'. Don't manually path with move commands.
+
+MESSAGES:
+- MESSAGES shows recent game log output (combat hits/misses, environmental text, item pickups, etc.)
+- Use these to understand what happened since your last turn — they provide ground truth the events may miss.
 
 EXPLORATION:
 - After entering a new zone, check the ENTITIES list for interesting things (creatures, NPCs, items).
@@ -637,12 +699,37 @@ EXPLORATION:
 - Use 'examine' on unfamiliar things. Use 'pickup' for items on ground.
 - Caves contain knickknacks (quest items) and monsters. Be prepared before entering.
 
+INVENTORY & EQUIPMENT:
+- ALWAYS check your inventory with 'status' early on. Equip weapons, armor, and useful items.
+- Use 'equip <item>' to wear/wield items from inventory. Check EQUIPMENT section in status.
+- Use 'pickup <item>' to grab items from the ground after kills or in rooms.
+- Use 'eat' and 'drink' to consume food/water. Keep fed and hydrated.
+- Use 'examine <item>' to inspect items before equipping — check stats, damage, etc.
+
+TRADING & SHOPS:
+- Use 'trade <merchant name>' when adjacent to a merchant to view their inventory.
+- Tam (dromad merchant) in Joppa sells weapons, armor, and supplies. VISIT HIM.
+- Buy better weapons/armor if you can afford it. Sell junk items.
+
+SKILLS & ABILITIES:
+- Use 'status' to check your mutations, skills, and abilities.
+- Use 'activate <ability>' to use mutations or activated abilities in combat.
+- When you level up, the game will prompt for stat/skill choices — make them.
+
+MANDATORY VILLAGE PREP (do ALL of these BEFORE leaving the village):
+1. 'status' — check your stats, inventory, equipment, mutations, skills. Do this FIRST.
+2. 'examine <item>' — inspect each inventory item to understand what you have.
+3. 'equip <item>' — equip your best weapon and armor. Check equipment slots.
+4. 'eat' and 'drink' — consume food/water to stay fed and hydrated.
+5. 'navigate Tam' then 'trade Tam' — visit the dromad merchant. Buy better gear if affordable. Sell junk.
+6. Talk to ALL quest NPCs (Irudad, Argyve, Mehmet) and accept quests.
+7. 'save' — save before leaving the village.
+DO NOT leave the village until you have done steps 1-7. This is critical for survival.
+
 STARTING VILLAGE:
-You may start in Joppa (most common) or another village (Issachari camps, etc).
-In ANY village: find the village elder/leader, tinker, merchant. Talk to them for quests.
+You may start in Joppa (most common) or another village.
 If Joppa: Elder Irudad (work quest), Argyve (knickknack→main story), Tam (merchant), Mehmet (vermin)
-If elsewhere: explore, talk to all named NPCs (not generic "raider"), find the tinker and elder.
-Quest flow: village quests → explore nearby → caves for items → return → advance main story → Grit Gate
+Quest flow: village prep (status/equip/trade/quests) → explore nearby → caves → return → advance
 
 RESPOND WITH ONLY JSON. Two response formats:
 
@@ -697,6 +784,23 @@ function buildPrompt(state, journal, lastPlanResults) {
     popupWarning = `\n*** WARNING: A POPUP is blocking the game. You must dismiss it before other commands will work. Try 'choose 0' or an appropriate dismiss action. ***\n`;
   }
 
+  // Hostile/danger warning
+  let dangerWarning = '';
+  const hostiles = (state?.entities || []).filter(e => e.hostile);
+  if (hostiles.length > 0) {
+    const nearbyHostiles = hostiles.filter(e => {
+      const dx = Math.abs(e.x - (state.position?.x || 0));
+      const dy = Math.abs(e.y - (state.position?.y || 0));
+      return dx + dy <= 10;
+    });
+    const hostileNames = [...new Set(hostiles.map(e => e.name))].slice(0, 8).join(', ');
+    dangerWarning = `\n*** HOSTILES: ${hostiles.length} in zone (${nearbyHostiles.length} within 10 tiles). Types: ${hostileNames}. ***`;
+    if ((state.zoneName || '').toLowerCase().includes('lair')) {
+      dangerWarning += `\n*** DANGER: You are in a LAIR zone. Expect overwhelming enemies. FLEE IMMEDIATELY unless you are very strong. ***`;
+    }
+    dangerWarning += '\n';
+  }
+
   return `${stateSummary}
 
 OBJECTIVES: ${journal.objectives.join('; ')}
@@ -707,29 +811,16 @@ RECENT HISTORY:
 ${recent || '(first turn)'}
 
 ${lastResults}
-${stuckWarning}${popupWarning}
+${stuckWarning}${popupWarning}${dangerWarning}
 What's your next action?`;
 }
 
 // --- LLM call ---
 async function callLLM(userPrompt, model) {
   const useModel = model || BASE_MODEL;
-  const fullPrompt = SYSTEM_PROMPT + '\n\n---\n\n' + userPrompt;
-
-  return new Promise((resolve, reject) => {
-    const child = spawn('claude', ['-p', '--model', useModel, '--output-format', 'text'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    let stdout = '', stderr = '';
-    child.stdout.on('data', d => stdout += d);
-    child.stderr.on('data', d => stderr += d);
-    child.on('close', code => {
-      if (code !== 0) return reject(new Error(`claude exit ${code}: ${stderr}`));
-      resolve(stdout.trim());
-    });
-    child.stdin.write(fullPrompt);
-    child.stdin.end();
-  });
+  const resolvedModel = llm.resolveModel(useModel);
+  log('LLM', `Calling ${llm.name}/${resolvedModel}`);
+  return llm.call(SYSTEM_PROMPT, userPrompt, useModel);
 }
 
 function parseLLMResponse(raw) {
@@ -758,6 +849,57 @@ function log(tag, msg) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// --- Reload from last save after death ---
+const RELOAD_SCRIPT = path.join(__dirname, 'mud-daemon', 'qud-reload.sh');
+
+async function attemptReload() {
+  // Check if reload script exists
+  if (!fs.existsSync(RELOAD_SCRIPT)) {
+    log('RELOAD', `No reload script at ${RELOAD_SCRIPT}`);
+    return false;
+  }
+
+  // Clear stale state so we can detect fresh game startup
+  const stateFile = path.join(IPC_DIR, 'state.json');
+  try { fs.unlinkSync(stateFile); } catch {}
+
+  log('RELOAD', 'Spawning qud-reload.sh...');
+  return new Promise((resolve) => {
+    const proc = spawn('bash', [RELOAD_SCRIPT], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
+    });
+
+    let output = '';
+    proc.stdout.on('data', (d) => { output += d.toString(); });
+    proc.stderr.on('data', (d) => { output += d.toString(); });
+
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        log('RELOAD', `Script exited with code ${code}: ${output.slice(-200)}`);
+        resolve(false);
+        return;
+      }
+      log('RELOAD', 'Script completed. Waiting for game state...');
+    });
+
+    // Wait up to 90s for state.json to reappear with hp > 0
+    const deadline = Date.now() + 90000;
+    const poll = setInterval(() => {
+      const s = readState();
+      if (s && s.hp > 0) {
+        clearInterval(poll);
+        log('RELOAD', `Game reloaded! ${s.name} HP:${s.hp}/${s.maxHp} at ${s.zoneName}`);
+        resolve(true);
+      } else if (Date.now() > deadline) {
+        clearInterval(poll);
+        log('RELOAD', 'Timed out waiting for game to reload');
+        resolve(false);
+      }
+    }, 3000);
+  });
+}
 
 // --- Typed Action Schema (internal, for logging and future use) ---
 function buildTypedAction(cmd) {
@@ -829,13 +971,105 @@ async function main() {
 
     log('STATE', `${state.name} HP:${state.hp}/${state.maxHp} (${state.position?.x},${state.position?.y}) ${state.zoneName} T${state.turn}`);
 
+    // Message buffer diagnostics
+    if (state.messages && state.messages.length > 0) {
+      log('MSGS ', `${state.messages.length} messages: ${state.messages.slice(-3).join(' | ')}`);
+    } else {
+      log('MSGS ', 'No messages in state (C# extraction may be failing)');
+    }
+
     // Update zone map and position history
     updateZoneMap(journal, state, prevState);
     updatePositionHistory(journal, state);
     trackNavigateFailures(journal, lastPlanResults);
 
-    // Check HP - emergency heal
-    if (state.hp < state.maxHp * 0.5 && state.hp > 0) {
+    // --- Danger detection: lair/legendary zones and hostile swarms ---
+    const zoneName = (state.zoneName || '').toLowerCase();
+    const isLair = zoneName.includes('lair') || zoneName.includes('legendary');
+    const hostiles = (state.entities || []).filter(e => e.hostile);
+    const hostileCount = hostiles.length;
+    const nearbyHostiles = hostiles.filter(e => {
+      const dx = Math.abs(e.x - (state.position?.x || 0));
+      const dy = Math.abs(e.y - (state.position?.y || 0));
+      return dx + dy <= 8;
+    });
+
+    const playerLevel = state.level || 1;
+    // Auto-flee thresholds scale with level: low level = flee aggressively, high level = trust the LLM
+    const shouldAutoFlee = (isLair && playerLevel < 5) ||
+                           (hostileCount >= 15 && playerLevel < 8) ||
+                           (nearbyHostiles.length >= 5 && playerLevel < 8);
+
+    if (shouldAutoFlee) {
+      const reason = isLair ? `LAIR ZONE: ${state.zoneName}` :
+                     nearbyHostiles.length >= 5 ? `${nearbyHostiles.length} hostiles within 8 tiles` :
+                     `${hostileCount} hostiles in zone`;
+      log('DANGER', `${reason} — AUTO-FLEEING (level ${playerLevel} too low)`);
+
+      // Determine flee direction: reverse of how we entered, or away from nearest hostile
+      let fleeDir = '';
+      const pos = state.position || {};
+      if (prevState?.zone && prevState.zone !== state.zone) {
+        // Reverse entry direction based on position on zone edge
+        if (pos.y <= 2) fleeDir = 's';
+        else if (pos.y >= 22) fleeDir = 'n';
+        else if (pos.x <= 2) fleeDir = 'e';
+        else if (pos.x >= 77) fleeDir = 'w';
+      }
+      if (!fleeDir && nearbyHostiles.length > 0) {
+        // Flee away from nearest hostile
+        const nearest = nearbyHostiles.sort((a, b) =>
+          (Math.abs(a.x - pos.x) + Math.abs(a.y - pos.y)) -
+          (Math.abs(b.x - pos.x) + Math.abs(b.y - pos.y))
+        )[0];
+        const dx = pos.x - nearest.x;
+        const dy = pos.y - nearest.y;
+        if (Math.abs(dy) >= Math.abs(dx)) fleeDir = dy >= 0 ? 's' : 'n';
+        else fleeDir = dx >= 0 ? 'e' : 'w';
+      }
+      if (!fleeDir) fleeDir = 'w'; // default: retreat west (toward Joppa)
+
+      log('FLEE', `Running ${fleeDir} (${20} steps)`);
+      for (let i = 0; i < 20; i++) {
+        const r = await executeStep(buildTypedAction(`move ${fleeDir}`));
+        if (r._moveBlocked) {
+          // Try perpendicular directions
+          const alts = fleeDir === 'n' || fleeDir === 's' ? ['e', 'w'] : ['n', 's'];
+          let escaped = false;
+          for (const alt of alts) {
+            const r2 = await executeStep(buildTypedAction(`move ${alt}`));
+            if (!r2._moveBlocked) { escaped = true; break; }
+          }
+          if (!escaped) break;
+        }
+      }
+      lastPlanResults = [{ command: `flee:${fleeDir}`, result: { status: 'ok' }, failed: false, summary: `Fled ${fleeDir} from ${reason}` }];
+      prevState = state;
+      continue; // skip LLM call this turn — just run
+    }
+
+    // Hostile awareness logging (non-emergency)
+    if (hostileCount > 0) {
+      log('ALERT', `${hostileCount} hostiles in zone (${nearbyHostiles.length} nearby)`);
+    }
+
+    // Check HP - emergency heal or flee
+    if (state.hp < state.maxHp * 0.3 && state.hp > 0 && nearbyHostiles.length > 0) {
+      log('AGENT', 'CRITICAL HP + nearby hostiles — fleeing then healing');
+      // Flee first
+      const nearest = nearbyHostiles.sort((a, b) =>
+        (Math.abs(a.x - (state.position?.x||0)) + Math.abs(a.y - (state.position?.y||0))) -
+        (Math.abs(b.x - (state.position?.x||0)) + Math.abs(b.y - (state.position?.y||0)))
+      )[0];
+      const dx = (state.position?.x||0) - nearest.x;
+      const dy = (state.position?.y||0) - nearest.y;
+      const fleeDir = Math.abs(dy) >= Math.abs(dx) ? (dy >= 0 ? 's' : 'n') : (dx >= 0 ? 'e' : 'w');
+      for (let i = 0; i < 5; i++) await executeStep(buildTypedAction(`move ${fleeDir}`));
+      await harness.eat();
+      await sleep(500);
+      await harness.rest();
+      await sleep(1000);
+    } else if (state.hp < state.maxHp * 0.5 && state.hp > 0) {
       log('AGENT', 'LOW HP — auto-healing');
       await harness.eat();
       await sleep(500);
@@ -921,7 +1155,7 @@ async function main() {
 
       const results = await executePlan(decision.steps);
       lastPlanResults = results;
-      outcomeStr = results.map(r => `${r.command}:${r.failed?'FAIL':'OK'}`).join('; ');
+      outcomeStr = results.map(r => `${r.command}:${r.blocked?'WALL':r.failed?'FAIL':'OK'}`).join('; ');
       details = results.map(r => r.summary).join(' | ');
 
       // Collect quest actions from results (Change 4 — add to journal)
@@ -961,6 +1195,12 @@ async function main() {
 
     writeJournal(journal);
 
+    // Auto-save every 10 turns
+    if ((turn + 1) % 10 === 0) {
+      log('SAVE ', `Auto-saving at turn ${turn + 1}`);
+      try { await harness.save(); } catch (e) { log('SAVE ', `Save failed: ${e.message}`); }
+    }
+
     // Check for death
     await sleep(500);
     const newState = readState();
@@ -968,7 +1208,18 @@ async function main() {
       log('AGENT', 'CHARACTER DIED!');
       journal.deaths++;
       writeJournal(journal);
-      break;
+
+      // Attempt reload from last save
+      log('AGENT', 'Attempting reload from last save...');
+      const reloaded = await attemptReload();
+      if (reloaded) {
+        log('AGENT', 'Reloaded successfully! Continuing from last save...');
+        prevState = null;
+        continue;
+      } else {
+        log('AGENT', 'Reload failed (permadeath or no saves). Ending session.');
+        break;
+      }
     }
 
     await sleep(1500);

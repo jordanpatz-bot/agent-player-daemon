@@ -1,0 +1,20 @@
+{
+  "tile_width": 24,
+  "tile_height": 36.11,
+  "grid_offset_x": 0,
+  "grid_offset_y": 70.1,
+  "grid_cols": 80,
+  "grid_rows": 25,
+  "viewport_width": 1080,
+  "viewport_height": 903.0,
+  "sidebar_start_x": 1080,
+  "window_size": [
+    1728,
+    1084
+  ],
+  "viewport_scrolls_x": true,
+  "viewport_scrolls_y": false,
+  "console_rows": 30,
+  "status_bar_rows": 2,
+  "notes": "Fullscreen 1728x1117 (1728x1084 game window). Tiles 24x36.1 px. Viewport scrolls horizontally (24px/tile) but NOT vertically. All 25 game rows always visible. Internal render 1728x1728 stretched to 1728x1084."
+}

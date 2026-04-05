@@ -1,0 +1,42 @@
+{
+  "@player": {
+    "count": 1,
+    "hostile": false,
+    "category": "player"
+  },
+  "Nima Ruda": {
+    "count": 1,
+    "hostile": false,
+    "category": "npc"
+  },
+  "Elder Irudad": {
+    "count": 1,
+    "hostile": false,
+    "category": "npc"
+  },
+  "Ctesiphus": {
+    "count": 1,
+    "hostile": false,
+    "category": "npc"
+  },
+  "Warden Yrame": {
+    "count": 1,
+    "hostile": false,
+    "category": "npc"
+  },
+  "watervine farmer and Mechanimist convert": {
+    "count": 1,
+    "hostile": false,
+    "category": "npc"
+  },
+  "Mehmet": {
+    "count": 1,
+    "hostile": false,
+    "category": "npc"
+  },
+  "watervine farmer": {
+    "count": 7,
+    "hostile": false,
+    "category": "npc"
+  }
+}

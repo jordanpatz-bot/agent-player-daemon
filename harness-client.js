@@ -14,30 +14,67 @@ class HarnessClient {
   /**
    * @param {string} [ipcDir] — path to the IPC directory (contains state.json, command.txt, etc.)
    */
-  constructor(ipcDir) {
+  constructor(ipcDir, opts = {}) {
     this.ipcDir = ipcDir || DEFAULT_IPC_DIR;
     this.paths = {
       state:    path.join(this.ipcDir, 'state.json'),
+      visionState: path.join(this.ipcDir, 'vision-state.json'),
       events:   path.join(this.ipcDir, 'events.jsonl'),
       request:  path.join(this.ipcDir, 'request.json'),
       response: path.join(this.ipcDir, 'response.json'),
       command:  path.join(this.ipcDir, 'command.txt'),
       result:   path.join(this.ipcDir, 'result.json'),
     };
-    this._legacyMode = false; // set true after first request.json timeout
+    this._legacyMode = false;
+    this._typedTimeouts = 0;
+    this._typedSuccesses = 0;
+    // Vision mode: read perception from vision-state.json instead of state.json
+    this._visionMode = opts.visionMode || false;
   }
 
   // ---------------------------------------------------------------------------
   // State access
   // ---------------------------------------------------------------------------
 
-  /** Read current state.json. Returns parsed object or null. */
+  /** Read current state. In vision mode, merges vision entities with mod state
+   *  (mod provides stats/inventory/quests, vision provides entity perception). */
   readState() {
+    // Always read mod state for stats, inventory, quests, etc.
+    let modState = null;
     try {
-      return JSON.parse(fs.readFileSync(this.paths.state, 'utf8'));
-    } catch {
-      return null;
+      modState = JSON.parse(fs.readFileSync(this.paths.state, 'utf8'));
+    } catch {}
+
+    if (!this._visionMode) return modState;
+
+    // In vision mode: overlay vision entities onto mod state
+    let visionState = null;
+    try {
+      visionState = JSON.parse(fs.readFileSync(this.paths.visionState, 'utf8'));
+    } catch {}
+
+    if (!modState) return visionState; // mod dead, use vision only
+    if (!visionState || !visionState.position) return modState; // no vision, use mod
+
+    // Merge: mod state is the base, vision provides entity perception
+    const merged = { ...modState };
+    // Use vision entities if available (these come from screen capture)
+    if (visionState.entities && visionState.entities.length > 0) {
+      merged._visionEntities = visionState.entities;
+      // Keep mod entities as ground truth but annotate with vision confidence
+      const visionSet = new Set(visionState.entities.map(e => `${e.x},${e.y}`));
+      merged.entities = (merged.entities || []).map(e => ({
+        ...e,
+        _visionDetected: visionSet.has(`${e.x},${e.y}`),
+      }));
     }
+    // Merge vision messages (OCR sidebar) if available
+    if (visionState.messages && visionState.messages.length > 0) {
+      merged._visionMessages = visionState.messages;
+    }
+    merged._visionActive = true;
+    merged._visionStats = visionState._vision || {};
+    return merged;
   }
 
   /** Read events.jsonl lines since a given ISO timestamp (or all if omitted). */
@@ -118,6 +155,8 @@ class HarnessClient {
           const resp = JSON.parse(raw);
           // Match by commandId
           if (resp.commandId === commandId) {
+            this._typedSuccesses++;
+            this._typedTimeouts = 0; // reset on success
             return resp;
           }
           // If commandId doesn't match, it might be stale — keep waiting
@@ -126,8 +165,11 @@ class HarnessClient {
       await _sleep(POLL_INTERVAL);
     }
 
-    // Timed out — mark legacy mode for future calls
-    this._legacyMode = true;
+    // Timed out — only switch to legacy after 3 consecutive typed timeouts
+    this._typedTimeouts++;
+    if (this._typedTimeouts >= 3) {
+      this._legacyMode = true;
+    }
     return { commandId, status: 'timeout', error: 'No response within timeout (request.json protocol)' };
   }
 
@@ -175,19 +217,34 @@ class HarnessClient {
   async performAction(action, options = {}) {
     const timeout = options.timeout || DEFAULT_TIMEOUT;
 
-    // If we know the bridge is legacy-only, or caller forces legacy, use command.txt
-    if (this._legacyMode || options.forceLegacy) {
+    // If caller forces legacy, use command.txt
+    if (options.forceLegacy) {
       const cmd = _actionToLegacyCommand(action);
       return this.sendLegacyCommand(cmd, timeout);
     }
 
-    // Try typed protocol first
-    const resp = await this.sendRequest({ kind: 'perform_action', action }, timeout);
+    // Periodically retry typed protocol even in legacy mode (every 10 commands)
+    const shouldRetryTyped = this._legacyMode && (this._typedSuccesses + this._typedTimeouts) % 10 === 0;
 
-    if (resp.status === 'timeout') {
-      // Typed protocol timed out — fall back to legacy
+    if (this._legacyMode && !shouldRetryTyped) {
       const cmd = _actionToLegacyCommand(action);
       return this.sendLegacyCommand(cmd, timeout);
+    }
+
+    // Try typed protocol
+    const request = { kind: 'perform_action', action };
+    if (options.postconditions) request.postconditions = options.postconditions;
+    const resp = await this.sendRequest(request, timeout);
+
+    if (resp.status === 'timeout') {
+      // Typed protocol timed out — fall back to legacy for this call
+      const cmd = _actionToLegacyCommand(action);
+      return this.sendLegacyCommand(cmd, timeout);
+    }
+
+    // Typed protocol worked — exit legacy mode if we were in it
+    if (this._legacyMode) {
+      this._legacyMode = false;
     }
 
     return resp;
@@ -307,6 +364,33 @@ class HarnessClient {
   async save()                { return this.performAction({ type: 'system.save' }); }
   async status()              { return this.performAction({ type: 'system.status' }); }
   async rest()                { return this.performAction({ type: 'survival.rest' }); }
+
+  // ---------------------------------------------------------------------------
+  // Postcondition helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Check if a response's postconditions were all met.
+   * Returns true if no postconditions were specified (vacuously true),
+   * or if all postconditions passed.
+   * @param {object} resp — response from performAction
+   * @returns {boolean}
+   */
+  static postconditionsMet(resp) {
+    if (!resp || !resp.postconditions) return true; // no postconditions = vacuously true
+    if (!resp.postconditions.evaluated) return false;
+    return resp.postconditions.allMet === true;
+  }
+
+  /**
+   * Get detailed postcondition results from a response.
+   * @param {object} resp — response from performAction
+   * @returns {Array|null} — array of {path, condition, priorValue, currentValue, passed} or null
+   */
+  static postconditionDetails(resp) {
+    if (!resp || !resp.postconditions || !resp.postconditions.results) return null;
+    return resp.postconditions.results;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -357,4 +441,4 @@ function _getNestedValue(obj, dotPath) {
   return current;
 }
 
-module.exports = { HarnessClient, _actionToLegacyCommand, _getNestedValue };
+module.exports = { HarnessClient, _actionToLegacyCommand, _getNestedValue, postconditionsMet: HarnessClient.postconditionsMet };
